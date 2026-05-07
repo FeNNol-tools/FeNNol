@@ -269,7 +269,7 @@ def tril_cell_(cell):
     cos_beta = jnp.dot(cell[0], cell[2]) / (a * c)
     cos_gamma = jnp.dot(cell[0], cell[1]) / (a * b)
     cell_tril = cell_lengths_angles_to_tril(a, b, c, cos_alpha, cos_beta, cos_gamma)
-    rotation = cell_tril @ jnp.linalg.inv(cell)
+    rotation = jnp.linalg.inv(cell) @ cell_tril
     return cell_tril, rotation
 
 
