@@ -383,6 +383,7 @@ class Activation(nn.Module):
         output_key = self.output_key if self.output_key is not None else self.key
         return {**inputs, output_key: output}
 
+
 class LayerNorm(nn.Module):
     """Layer normalization module.
 
@@ -413,18 +414,17 @@ class LayerNorm(nn.Module):
         else:
             x = inputs
         mu = jnp.mean(x, axis=self.axis, keepdims=True)
-        dx = x-mu
-        var = jnp.mean(dx ** 2, axis=self.axis, keepdims=True)
+        dx = x - mu
+        var = jnp.mean(dx**2, axis=self.axis, keepdims=True)
         sig = (self.epsilon + var) ** (-0.5)
         out = self.scale * (sig * dx) + self.shift
 
         output_key = self.output_key if self.output_key is not None else self.key
-        
+
         if isinstance(inputs, dict):
             return {**inputs, output_key: out}
-        
+
         return out
-        
 
 
 class Scale(nn.Module):
@@ -534,7 +534,7 @@ class Reshape(nn.Module):
 
     key: str
     """The key of the input array."""
-    shape: Sequence[Union[int,str]]
+    shape: Sequence[Union[int, str]]
     """The shape of the output array."""
     output_key: Optional[str] = None
     """The key of the output array. If None, the input key is used."""
@@ -545,20 +545,27 @@ class Reshape(nn.Module):
     def __call__(self, inputs) -> Any:
         shape = []
         for s in self.shape:
-            if isinstance(s,int):
+            if isinstance(s, int):
                 shape.append(s)
                 continue
 
-            if isinstance(s,str):
-                s_=s.lower().strip()
-                if s_ in ["natoms" ,"nat","natom","n_atoms","atoms"]:
+            if isinstance(s, str):
+                s_ = s.lower().strip()
+                if s_ in ["natoms", "nat", "natom", "n_atoms", "atoms"]:
                     shape.append(inputs["species"].shape[0])
                     continue
-                
-                if s_ in ["nsys","nbatch","nsystems","n_sys","n_systems","n_batch"]:
+
+                if s_ in [
+                    "nsys",
+                    "nbatch",
+                    "nsystems",
+                    "n_sys",
+                    "n_systems",
+                    "n_batch",
+                ]:
                     shape.append(inputs["natoms"].shape[0])
                     continue
-                
+
                 s_ = s.strip().split("[")
                 key = s_[0]
                 if key in inputs:
@@ -658,7 +665,7 @@ class SwitchFunction(nn.Module):
                 ), "cutoff must be specified if no graph is given"
                 # edge_mask = distances < self.cutoff
                 cutoff = self.cutoff
-                
+
         if self.switch_start > 1.0e-5:
             assert (
                 self.switch_start < 1.0
@@ -696,16 +703,21 @@ class SwitchFunction(nn.Module):
             r2 = x**2
             c2 = end**2
             switch = jnp.exp(-p * r2 / (c2 - r2))
-            
+
         elif switch_type == "bump":
-            assert self.switch_start < 1.0e-5, "switch_start is not supported for bump switch. Use the 'p' parameter to control the width of the switch instead."
+            assert (
+                self.switch_start < 1.0e-5
+            ), "switch_start is not supported for bump switch. Use the 'p' parameter to control the width of the switch instead."
             p = self.p if self.p is not None else 0.5
-            scaled = (x - (end - p))/p
-            mask_smaller = scaled <=0
+            scaled = (x - (end - p)) / p
+            mask_smaller = scaled <= 0
             mask_active = jnp.logical_and(scaled > 0, scaled < 1)
             scaled = jnp.where(mask_active, scaled, 0.1)
-            switch = mask_smaller + mask_active * 0.5 * (1. + jnp.tanh(1./jnp.tan(scaled * jnp.pi))) 
-        
+            tanscaled = jnp.tan(scaled * jnp.pi)
+            eps = 1.e-6
+            tanscaled = jnp.where(jnp.abs(tanscaled) > eps, tanscaled, eps)
+            switch = mask_smaller + mask_active * 0.5 * (1.0 + jnp.tanh(1.0 / tanscaled))
+
         elif switch_type == "hard":
             switch = jnp.where(distances < cutoff, 1.0, 0.0)
         else:
