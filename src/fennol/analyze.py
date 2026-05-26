@@ -89,19 +89,20 @@ def get_file_reader(input_file,file_format=None,has_comment_line=True, periodic=
             for frame in frames:
                 species = np.array(frame["species"])
                 coordinates = np.array(frame["coordinates"])
-                inputs = {
+                inputs = frame.copy()  # Keep all keys
+                inputs.update({
                     "species": species,
                     "coordinates": coordinates,
                     "natoms": species.shape[0],
                     "total_charge": frame.get("total_charge", 0),
-                }
+                })
                 cell_key = "cells" if "cells" in frame else "cell"
                 if _periodic:
                     cell_key = "cells" if "cells" in frame else "cell"
                     cell = np.array(frame[cell_key]).reshape(3, 3)
                     inputs["cell"] = cell
                 yield inputs
-    
+
     return reader
 
 
@@ -127,7 +128,7 @@ def fennix_analyzer(input_file, model, output_keys,file_format=None,periodic=Fal
             cells = np.stack([frame["cell"] for frame in batch], axis=0)
             inputs["cells"] = cells
             inputs["reciprocal_cells"] = np.linalg.inv(cells)
-        
+
         inputs["flags"] = flags
 
         if "forces" in output_keys:
@@ -148,11 +149,14 @@ def fennix_analyzer(input_file, model, output_keys,file_format=None,periodic=Fal
         natshift = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(natoms)])
         frames_data = []
         for i in range(len(batch)):
-            frame_data = {
+            frame_data = batch[i].copy()  # keep all keys
+            frame_data.pop("batch_index", None)
+            frame_data.pop("natoms", None)
+            frame_data.update({
                 "species": species[natshift[i] : natshift[i + 1]],
                 "coordinates": coordinates[natshift[i] : natshift[i + 1]],
                 "total_charge": int(output["total_charge"][i]),
-            }
+            })
             if _periodic:
                 frame_data["cell"] = cells[i]
 
@@ -175,7 +179,7 @@ def fennix_analyzer(input_file, model, output_keys,file_format=None,periodic=Fal
                     raise ValueError(f"Output key {k} has wrong shape {v.shape} {natoms.shape} {species.shape}")
 
             frames_data.append(frame_data)
-        
+
         return frames_data
 
     batch = []
