@@ -151,7 +151,9 @@ def optimize_fire2(
     rmsF = np.sqrt(3 * np.mean(F**2))
     error = rmsF
     if error < atol:
-        return x
+        if keep_every > 0:
+            return x, True, [x.copy()]
+        return x, True
 
     if logoutput:
         print(
