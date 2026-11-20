@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, for the latest-dependencies job: upstream releases break things
+  # without any change here.
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -33,6 +37,25 @@ jobs:
     # The lockfile pins CPU-only torch for the training extra.
     - name: Install project from the lockfile
       run: uv sync --locked --extra train --group dev
+    - name: Run test suite
+      run: uv run --no-sync python -m pytest -q -rs
+
+  test-latest:
+    name: Test suite (latest dependencies)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: "3.13"
+    # What a fresh `pip install FeNNol` gets: the newest versions allowed by
+    # pyproject.toml, ignoring the versions pinned in uv.lock.
+    - name: Install project with the latest dependencies
+      run: uv sync --upgrade --extra train --group dev
+    - name: Show resolved versions
+      run: uv pip list | grep -E "^(jax|jaxlib|flax|numpy|optax|torch) "
     - name: Run test suite
       run: uv run --no-sync python -m pytest -q -rs
 

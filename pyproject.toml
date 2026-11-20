@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+requires = ["setuptools", "setuptools-scm>=10"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
@@ -7,6 +7,11 @@ version_file = "src/fennol/version.py"
 # Untagged builds are `<last tag>.post1.devN`, never a guess at the next release.
 version_scheme = "no-guess-dev"
 local_scheme = "no-local-version"
+
+[tool.setuptools_scm.tag]
+# Only release tags vYYYY.MM[.N] carry versions; other tags, such as
+# snapshot/<purpose>, must not break the version of every build.
+prefix = "v"
 
 [tool.setuptools]
 license-files = ["LICENSE"]
