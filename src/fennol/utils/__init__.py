@@ -1,11 +1,14 @@
-from .spherical_harmonics import CG_SO3, generate_spherical_harmonics
-from .atomic_units import AtomicUnits, UnitSystem
-from typing import Dict, Any,Sequence, Union
+from typing import Dict, Any,Sequence, Union, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
 from ase.geometry.cell import cellpar_to_cell
 import numba
+from pathlib import Path
+
+from .periodic_table import PERIODIC_TABLE,PERIODIC_TABLE_REV_IDX
+from .spherical_harmonics import CG_SO3, generate_spherical_harmonics
+from .atomic_units import AtomicUnits, UnitSystem
 
 def minmaxone(x, name=""):
     print(name, x.min(), x.max(), (x**2).mean() ** 0.5)
@@ -222,6 +225,114 @@ def detect_topology(species,coordinates, cell=None):
 
     return true_bonds
 
+def read_tinker_topology(filename:Union[str,Path],has_comment_line:bool=True) -> Tuple[int,np.ndarray]:
+    """
+    Reads a TINKER .arc or .xyz file and returns the topology as a np.ndarray of shape [nbonds,2].
+    """
+    with open(filename, "r") as f:
+        lines = f.readlines()
+    
+    first_line_parts = lines[0].strip().split()
+    num_atoms = int(first_line_parts[0])
+
+    shift = 2 if has_comment_line else 1
+    lines = lines[shift : shift + num_atoms]
+    bond_src = []
+    bond_dst = []
+    for i, line in enumerate(lines):
+        parts = line.split()
+        assert parts[0].isdigit(), f"Error parsing TINKER file {filename} at line {i+shift+1}: {line}"
+        for j_str in parts[6:]:
+            j = int(j_str) - 1
+            if j > i:
+                bond_src.append(i)
+                bond_dst.append(j)
+
+    topology = np.column_stack((np.array(bond_src, dtype=np.int32), np.array(bond_dst, dtype=np.int32)))
+
+    sorted_indices = np.lexsort((topology[:, 1], topology[:, 0]))
+    topology = topology[sorted_indices, :]
+    return num_atoms,topology
+
+def convert_sparse_to_dense_bonds(natoms,bond_src, bond_dst, size=6):
+    """
+    Convert sparse bond representation to dense bond representation.
+
+    Parameters
+    ----------
+    natoms: int
+        Number of atoms in the system.
+    bond_src: Array of shape (N_bonds,)
+        Source atom indices for each bond. Zero-based indexing.
+    bond_dst: Array of shape (N_bonds,)
+        Destination atom indices for each bond. Zero-based indexing.
+    size: int
+        Maximum number of bonds per atom.
+
+    Returns
+    -------
+    bonds: Array of shape (natoms, size)
+        Dense bond representation where bonds[i] contains the indices of atoms bonded to atom i.
+        If an atom has fewer than 'size' bonds, the remaining entries are filled with 0. One-based indexing.
+
+    """
+    bonds = np.zeros((natoms, size), dtype=np.int64)
+    nbonds = np.zeros(natoms, dtype=np.int64)
+    for i in range(bond_src.shape[0]):
+        src = bond_src[i]
+        dst = bond_dst[i]
+        if nbonds[src] < size:
+            bonds[src, nbonds[src]] = dst + 1
+            nbonds[src] += 1
+        if nbonds[dst] < size:
+            bonds[dst, nbonds[dst]] = src + 1
+            nbonds[dst] += 1
+    return bonds
+
+def find_molecules(natoms,bond_src, bond_dst):
+    """
+    Identify molecules in a system based on bonding information.
+
+    Returns
+    -------
+    molecule_index: Array of shape (N,)
+        Array indicating the molecule index for each atom.
+
+    """
+    # Build adjacency list
+    nbonds = np.zeros(natoms, dtype=np.int64)
+    np.add.at(nbonds, bond_src, 1)
+    np.add.at(nbonds, bond_dst, 1)
+    max_bonds = np.max(nbonds)
+    
+    bonds = -np.ones((natoms, max_bonds), dtype=np.int64)
+    nbonds = np.zeros(natoms, dtype=np.int64)
+    for i in range(bond_src.shape[0]):
+        src = bond_src[i]
+        dst = bond_dst[i]
+        bonds[src, nbonds[src]] = dst
+        nbonds[src] += 1
+        bonds[dst, nbonds[dst]] = src
+        nbonds[dst] += 1
+    # Depth-first search to find connected components
+    molecule_index = -np.ones(natoms, dtype=np.int64)
+    current_molecule = 0
+    for atom in range(natoms):
+        if molecule_index[atom] >= 0:
+            continue
+        stack = [atom]
+        while stack:
+            current_atom = stack.pop()
+            if molecule_index[current_atom] >= 0:
+                continue
+            molecule_index[current_atom] = current_molecule
+            for j in range(nbonds[current_atom]):
+                bonded_atom = bonds[current_atom, j]
+                if bonded_atom != -1 and molecule_index[bonded_atom] == -1:
+                    stack.append(bonded_atom)
+        current_molecule += 1
+    return molecule_index
+
 def get_energy_gradient_function(
         energy_function,
         gradient_keys: Sequence[str],
@@ -252,7 +363,7 @@ def get_energy_gradient_function(
             if "strain" in gradient_keys and "strain" not in data:
                 data = {**data, "strain": jnp.array(np.eye(3)[None, :, :].repeat(data["natoms"].shape[0], axis=0))}
             inputs = {k: data[k] for k in gradient_keys}
-            de, out = jax.grad(_etot, argnums=1, has_aux=True)(inputs)
+            de, out = jax.grad(_etot, argnums=0, has_aux=True)(inputs)
 
             return (
                 de,
@@ -265,8 +376,24 @@ def get_energy_gradient_function(
             return energy_gradient
 
 
-def read_tinker_interval(indices_interval: Sequence[Union[int,str]]) -> np.ndarray:
-    interval = [int(i) for i in indices_interval]
+def read_tinker_interval(indices_interval: Union[None,str,int,Sequence[int]]) -> np.ndarray:
+    if indices_interval is None:
+        return np.array([], dtype=np.int32)
+    if isinstance(indices_interval, str):
+        path = Path(indices_interval).expanduser().resolve()
+        if path.is_file():
+            indices_interval = np.loadtxt(indices_interval, dtype=int).flatten()
+        elif "," in indices_interval:
+            indices_interval = indices_interval.split(",")
+        else:
+            indices_interval = indices_interval.split()
+    if isinstance(indices_interval, int):
+        assert indices_interval > 0, "Syntax error in read_tinker_interval. Single index must be a positive integer."
+        return np.array([indices_interval], dtype=np.int32) - 1
+    try:
+        interval = [int(i) for i in indices_interval]
+    except ValueError:
+        raise ValueError("Syntax error in read_tinker_interval. Indices must be integers.")
     indices = []
     while len(interval) > 0:
         i = interval.pop(0)
@@ -275,9 +402,43 @@ def read_tinker_interval(indices_interval: Sequence[Union[int,str]]) -> np.ndarr
         elif i < 0:
             start = -i
             end = interval.pop(0)
-            assert end > start, "Syntax error in ligand indices. End index must be greater than start index."
+            assert end > start, "Syntax error in read_tinker_interval. End index must be greater than start index."
             indices.extend(range(start, end + 1))
         else:
-            raise ValueError("Syntax error in ligand indices. Indicing should be 1-based.")
+            raise ValueError("Syntax error in read_tinker_interval. Indicing should be 1-based.")
     indices = np.unique(np.array(indices, dtype=np.int32))
     return indices - 1  # Convert to zero-based indexing
+
+def read_species_list(system_species, species_list):
+    if species_list is None:
+        return np.array([], dtype=np.int32)
+    
+    species_list = species_list
+    if isinstance(species_list, str):
+        if "," in species_list:
+            species_list = species_list.split(",")
+        else:
+            species_list = species_list.split()
+    assert isinstance(
+        species_list, (list, tuple)
+    ), f"read_species_list: species_list must be a list of element symbols or atomic numbers"
+
+    atoms = []
+    species = system_species
+    for s in species_list:
+        s = str(s).strip().capitalize()
+        if s.isdigit():
+            s = int(s)
+            assert (
+                1 <= s < len(PERIODIC_TABLE_REV_IDX)
+            ), f"read_species_list: Invalid atomic number {s}"
+        else:
+            assert (
+                s in PERIODIC_TABLE_REV_IDX
+            ), f"read_species_list: Invalid element symbol '{s}'"
+            s = PERIODIC_TABLE_REV_IDX[s]
+        atoms.append(np.where(species == s)[0])
+    atoms = np.concatenate(atoms)
+
+    return np.unique(atoms)
+

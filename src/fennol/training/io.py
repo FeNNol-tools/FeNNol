@@ -1,16 +1,22 @@
-import os, io, sys
-import numpy as np
-from scipy.spatial.transform import Rotation
-from collections import defaultdict
-import pickle
 import glob
-from flax import traverse_util
-from typing import Dict, List, Tuple, Union, Optional, Callable, Sequence
-from .databases import DBDataset, H5Dataset
-from ..models.preprocessing import AtomPadding
+import io
+import os
+import pickle
 import re
-import json
-import yaml
+import sys
+import logging
+from collections import defaultdict
+from typing import Optional, Sequence, Any, Callable, Literal
+
+import numpy as np
+from flax import traverse_util
+from scipy.spatial.transform import Rotation
+
+from .databases import DBDataset, H5Dataset, HTTPDataset, ParquetDataset, build_split_indices
+from .config import TrainingConfig
+from ..models.preprocessing import AtomPadding
+
+logger = logging.getLogger(__name__)
 
 try:
     import tomlkit
@@ -18,7 +24,7 @@ except ImportError:
     tomlkit = None
 
 try:
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
 except ImportError:
     raise ImportError(
         "PyTorch is required for training models. Install the CPU version following instructions at https://pytorch.org/get-started/locally/"
@@ -27,21 +33,20 @@ except ImportError:
 from ..models import FENNIX
 
 
-def load_configuration(config_file: str) -> Dict[str, any]:
-    if config_file.endswith(".json"):
-        parameters = json.load(open(config_file))
-    elif config_file.endswith(".yaml") or config_file.endswith(".yml"):
-        parameters = yaml.load(open(config_file), Loader=yaml.FullLoader)
-    elif tomlkit is not None and config_file.endswith(".toml"):
-        parameters = tomlkit.loads(open(config_file).read())
-    else:
-        supported_formats = [".json", ".yaml", ".yml"]
-        if tomlkit is not None:
-            supported_formats.append(".toml")
-        raise ValueError(
-            f"Unknown config file format. Supported formats: {supported_formats}"
-        )
-    return parameters
+def _identity_batch(batch):
+    return batch
+
+
+class _PrefetchingDataLoader(DataLoader):
+    """Fetch batches in a worker and apply preprocessing in the caller."""
+
+    def __init__(self, *args, collate_fn, **kwargs):
+        super().__init__(*args, collate_fn=_identity_batch, **kwargs)
+        self._parent_collate = collate_fn
+
+    def __iter__(self):
+        for batch in super().__iter__():
+            yield self._parent_collate(batch)
 
 
 def load_dataset(
@@ -55,19 +60,21 @@ def load_dataset(
     split_data_inputs: bool = False,
     np_rng: Optional[np.random.Generator] = None,
     train_val_split: bool = True,
-    training_parameters: dict = {},
+    training_config: TrainingConfig | None = None,
     add_flags: Sequence[str] = ["training"],
     fprec: str = "float32",
+    log_dataset: Callable | None = None,
+    load_mode: Literal["inmemory", "on_demand"] = "on_demand",
+    load_chunk_size: int = 4096,
 ):
     """
     Load a dataset from a pickle file and return two iterators for training and validation batches.
 
     Args:
-        training_parameters (dict): A dictionary with the following keys:
-            - 'dspath': str. Path to the pickle file containing the dataset.
-            - 'batch_size': int. Number of samples per batch.
+        training_config (TrainingConfig): Validated training options.
         rename_refs (list, optional): A list of strings with the names of the reference properties to rename.
             Default is an empty list.
+        log_dataset (Callable): Method to register dataset to MLflow.
 
     Returns:
         tuple: A tuple of two infinite iterators, one for training batches and one for validation batches.
@@ -76,18 +83,21 @@ def load_dataset(
             - 'batch_index': np.ndarray. Array with the index of the system to which each atom
             if the keys "forces", "total_energy", "atomic_energies" or any of the elements in rename_refs are present, the keys are renamed by prepending "true_" to the key name.
     """
+    # default dataloader values
+    num_workers = 0
+    prefetch_factor = None
+    persistent_workers = False
 
-    assert isinstance(
-        training_parameters, dict
-    ), "training_parameters must be a dictionary."
+    if training_config is None:
+        training_config = TrainingConfig()
     assert isinstance(
         rename_refs, dict
     ), "rename_refs must be a dictionary with the keys to rename."
 
-    pbc_training = training_parameters.get("pbc_training", False)
-    minimum_image = training_parameters.get("minimum_image", False)
+    pbc_training = training_config.pbc_training
+    minimum_image = training_config.minimum_image
 
-    coordinates_ref_key = training_parameters.get("coordinates_ref_key", None)
+    coordinates_ref_key = training_config.coordinates_ref_key
 
     input_keys = [
         "species",
@@ -97,24 +107,32 @@ def load_dataset(
         "total_charge",
         "flags",
     ]
+    input_file_keys = {
+        "species",
+        "coordinates",
+        "total_charge",
+    }
     if pbc_training:
-        input_keys += ["cells", "reciprocal_cells"]
+        input_keys += ["cells", "reciprocal_cells", "cells_mask"]
+        input_file_keys.add("cell")
     if atom_padding:
         input_keys += ["true_atoms", "true_sys"]
     if coordinates_ref_key is not None:
         input_keys += ["system_index", "system_sign"]
+        input_file_keys.add(coordinates_ref_key)
 
     flags = {f: None for f in add_flags}
     if minimum_image and pbc_training:
         flags["minimum_image"] = None
 
-    additional_input_keys = set(training_parameters.get("additional_input_keys", []))
+    additional_input_keys = set(training_config.additional_input_keys)
     additional_input_keys_ = set()
     for key in additional_input_keys:
         if key not in input_keys:
             additional_input_keys_.add(key)
     additional_input_keys = additional_input_keys_
 
+    input_file_keys.update(additional_input_keys)
     all_inputs = set(input_keys + list(additional_input_keys))
 
     extract_all_keys = ref_keys is None
@@ -124,8 +142,10 @@ def load_dataset(
         for key in ref_keys:
             if key not in all_inputs:
                 ref_keys_.add(key)
+        input_file_keys.update(ref_keys)
+    input_file_keys = list(input_file_keys)
 
-    random_rotation = training_parameters.get("random_rotation", False)
+    random_rotation = training_config.random_rotation
     if random_rotation:
         assert np_rng is not None, "np_rng must be provided for adding noise."
 
@@ -152,33 +172,18 @@ def load_dataset(
             "forces": 1,
             "virial_tensor": 2,
             "stress_tensor": 2,
+            "pressure_tensor": 2,
             "virial": 2,
             "stress": 2,
         }
         if pbc_training:
             rotated_keys["cells"] = 1
-        user_rotated_keys = dict(training_parameters.get("rotated_keys", {}))
+        user_rotated_keys = dict(training_config.rotated_keys)
         for k, v in user_rotated_keys.items():
             assert (
                 v in valid_rotations
             ), f"Invalid rotation type for key {k}. Valid values are {valid_rotations}"
             rotated_keys[k] = v
-
-        # rotated_vector_keys = set(
-        #     ["coordinates", "forces"]
-        #     + list(training_parameters.get("rotated_vector_keys", []))
-        # )
-        # if pbc_training:
-        #     rotated_vector_keys.add("cells")
-
-        # rotated_tensor_keys = set(
-        #     ["virial_tensor", "stress_tensor", "virial", "stress"]
-        #     + list(training_parameters.get("rotated_tensor_keys", []))
-        # )
-        # assert rotated_vector_keys.isdisjoint(
-        #     rotated_tensor_keys
-        # ), "Rotated vector keys and rotated tensor keys must be disjoint."
-        # rotated_keys = rotated_vector_keys.union(rotated_tensor_keys)
 
         print(
             "Applying random rotations to the following keys if present:",
@@ -201,7 +206,7 @@ def load_dataset(
         def apply_random_rotations(output, nbatch):
             pass
 
-    flow_matching = training_parameters.get("flow_matching", False)
+    flow_matching = training_config.flow_matching
     if flow_matching:
         if ref_keys is not None:
             ref_keys.add("flow_matching_target")
@@ -230,10 +235,11 @@ def load_dataset(
 
     if pbc_training:
         print("Periodic boundary conditions are active.")
-        length_nopbc = training_parameters.get("length_nopbc", 1000.0)
+        length_nopbc = training_config.length_nopbc
 
         def add_cell(d, output):
-            if "cell" not in d:
+            cell_value = d.get("cell")
+            if cell_value is None or np.asarray(cell_value).size == 0:
                 cell = np.asarray(
                     [
                         [length_nopbc, 0.0, 0.0],
@@ -242,9 +248,12 @@ def load_dataset(
                     ],
                     dtype=fprec,
                 )
+                cells_mask = False
             else:
-                cell = np.asarray(d["cell"], dtype=fprec)
+                cell = np.asarray(cell_value, dtype=fprec)
+                cells_mask = True
             output["cells"].append(cell.reshape(1, 3, 3))
+            output["cells_mask"].append(np.asarray(cells_mask, dtype=bool))
 
     else:
 
@@ -317,12 +326,19 @@ def load_dataset(
             if coordinates_ref_key is not None:
                 output["system_index"].append(np.asarray([batch_index - 1]))
                 output["system_sign"].append(np.asarray([1]))
-                if coordinates_ref_key in d:
-                    dref = {**d, "coordinates": d[coordinates_ref_key]}
-                    atom_shift = add_keys(dref, output, atom_shift, batch_index)
-                    output["system_index"].append(np.asarray([batch_index - 1]))
-                    output["system_sign"].append(np.asarray([-1]))
-                    batch_index += 1
+
+                cref = d.get(coordinates_ref_key, None)
+                if cref is not None:
+                    cref_arr = np.asarray(cref)
+                    if cref_arr.ndim == 2 and cref_arr.shape[
+                        -1] == 3 and cref_arr.size > 0:
+                        dref = {**d, "coordinates": cref_arr}
+                        atom_shift = add_keys(dref, output, atom_shift,
+                                              batch_index)
+                        output["system_index"].append(
+                            np.asarray([batch_index - 1]))
+                        output["system_sign"].append(np.asarray([-1]))
+                        batch_index += 1
 
         nbatch_ = len(output["natoms"])
         apply_random_rotations(output,nbatch_)
@@ -330,16 +346,24 @@ def load_dataset(
 
         # Stack and concatenate the arrays
         for k, v in output.items():
-            if v[0].ndim == 0:
-                v = np.stack(v)
-            else:
-                v = np.concatenate(v, axis=0)
-            if np.issubdtype(v.dtype, np.floating):
-                v = v.astype(fprec)
+            try:
+                if v[0].ndim == 0:
+                    v = np.stack(v)
+                else:
+                    v = np.concatenate(v, axis=0)
+                if np.issubdtype(v.dtype, np.floating):
+                    v = v.astype(fprec)
+            except Exception as e:
+                print(f"Error stacking key '{k}': {e}")
+                raise e
             output[k] = v
 
         if "cells" in output and pbc_training:
-            output["reciprocal_cells"] = np.linalg.inv(output["cells"])
+            try:
+                output["reciprocal_cells"] = np.linalg.inv(output["cells"])
+            except np.linalg.LinAlgError:
+                raise ValueError(
+                    "Encountered singular cell; cannot compute reciprocal_cells.")
 
         # Rename necessary keys
         # for key in rename_refs:
@@ -360,7 +384,7 @@ def load_dataset(
 
     ### collate preprocessing
     # add noise to the training data
-    noise_sigma = training_parameters.get("noise_sigma", None)
+    noise_sigma = training_config.noise_sigma
     if noise_sigma is not None:
         assert isinstance(noise_sigma, dict), "noise_sigma should be a dictionary"
 
@@ -384,7 +408,7 @@ def load_dataset(
         collate_layers_train.append(collate_with_noise)
 
     if atom_padding:
-        padder = AtomPadding(add_sys=training_parameters.get("padder_add_sys", 0))
+        padder = AtomPadding(add_sys=training_config.padder_add_sys)
         padder_state = padder.init()
 
         def collate_with_padding(batch):
@@ -436,24 +460,35 @@ def load_dataset(
                 batch = layer(batch)
             return batch
 
-    if not os.path.exists(dspath):
+    is_url = dspath.lower().startswith(("http://", "https://"))
+    if not is_url and not os.path.exists(dspath):
         raise ValueError(f"Dataset file '{dspath}' not found.")
-    # dspath = training_parameters.get("dspath", None)
+    # dspath is passed explicitly by the caller.
     print(f"Loading dataset from {dspath}...", end="")
     # print(f"   the following keys will be renamed if present : {rename_refs}")
     sharded_training = False
-    if dspath.endswith(".db"):
-        dataset = {}
+    if is_url:
         if train_val_split:
-            dataset["training"] = DBDataset(dspath, table="training")
-            dataset["validation"] = DBDataset(dspath, table="validation")
+            dataset = {
+                "training": HTTPDataset(dspath, val=False, batch_size=batch_size),
+                "validation": HTTPDataset(dspath, val=True, batch_size=batch_size_val if batch_size_val is not None else batch_size),
+            }
+        else:
+            dataset = HTTPDataset(dspath, val=False, batch_size=batch_size)
+    elif dspath.endswith(".db"):
+        if train_val_split:
+            dataset = {
+                "training": DBDataset(dspath, table="training"),
+                "validation": DBDataset(dspath, table="validation"),
+            }
         else:
             dataset = DBDataset(dspath)
     elif dspath.endswith(".h5") or dspath.endswith(".hdf5"):
-        dataset = {}
         if train_val_split:
-            dataset["training"] = H5Dataset(dspath, table="training")
-            dataset["validation"] = H5Dataset(dspath, table="validation")
+            dataset = {
+                "training": H5Dataset(dspath, table="training"),
+                "validation": H5Dataset(dspath, table="validation"),
+            }
         else:
             dataset = H5Dataset(dspath)
     elif dspath.endswith(".pkl") or dspath.endswith(".pickle"):
@@ -461,48 +496,139 @@ def load_dataset(
             dataset = pickle.load(f)
         if not train_val_split and isinstance(dataset, dict):
             dataset = dataset["training"]
+
+    elif dspath.endswith(".parquet"):
+        if train_val_split:
+            train_idx, val_idx = build_split_indices(dspath)
+            full_ds = ParquetDataset(
+                dspath, columns=input_file_keys, mode=load_mode, chunk_size=load_chunk_size
+            )
+            train_ds = Subset(full_ds, train_idx)
+            val_ds = Subset(full_ds, val_idx)
+            dataset = {
+                "training": train_ds,
+                "validation": val_ds,
+            }
+        else:
+            dataset = ParquetDataset(
+                dspath, columns=input_file_keys, mode=load_mode, chunk_size=load_chunk_size
+            )
+
     elif os.path.isdir(dspath):
         if train_val_split:
             dataset = {}
-            with open(dspath + "/validation.pkl", "rb") as f:
-                dataset["validation"] = pickle.load(f)
+            val_pkl = os.path.join(dspath, "validation.pkl")
+            val_parquet = os.path.join(dspath, "validation.parquet")
+            if os.path.exists(val_pkl):
+                with open(val_pkl, "rb") as f:
+                    dataset["validation"] = pickle.load(f)
+            elif os.path.exists(val_parquet):
+                dataset["validation"] = ParquetDataset(
+                    val_parquet, columns=input_file_keys, mode=load_mode, chunk_size=load_chunk_size
+                )
+            else:
+                pass
         else:
             dataset = None
-
-        shard_files = sorted(glob.glob(dspath + "/training_*.pkl"))
-        nshards = len(shard_files)
-        if nshards == 0:
-            raise ValueError("No dataset shards found.")
-        elif nshards == 1:
-            with open(shard_files[0], "rb") as f:
-                if train_val_split:
-                    dataset["training"] = pickle.load(f)
-                else:
-                    dataset = pickle.load(f)
+        pkl_shards = sorted(glob.glob(os.path.join(dspath, "training_*.pkl")))
+        parquet_shards = sorted(
+            glob.glob(os.path.join(dspath, "training_*.parquet")))
+        if pkl_shards:
+            shard_files = pkl_shards
+            shard_kind = "Pickle"
+        elif parquet_shards:
+            shard_files = parquet_shards
+            shard_kind = "Parquet"
         else:
-            print(f"Found {nshards} dataset shards.")
+            raise ValueError("No dataset shards found.")
+        nshards = len(shard_files)
+        if nshards == 1:
+            shard = shard_files[0]
+            if shard.endswith(".pkl"):
+                with open(shard, "rb") as f:
+                    if train_val_split:
+                        dataset["training"] = pickle.load(f)
+                    else:
+                        dataset = pickle.load(f)
+            else:
+                if train_val_split:
+                    if "validation" not in dataset:
+                        tr_idx, va_idx = build_split_indices(shard)
+                        full = ParquetDataset(shard, columns=input_file_keys,
+                                              mode=load_mode,
+                                              chunk_size=load_chunk_size)
+                        dataset["training"] = Subset(full, tr_idx)
+                        dataset["validation"] = Subset(full, va_idx)
+                    else:
+                        dataset["training"] = ParquetDataset(
+                            shard, columns=input_file_keys, mode=load_mode,
+                            chunk_size=load_chunk_size
+                        )
+                else:
+                    dataset = ParquetDataset(
+                        shard, columns=input_file_keys, mode=load_mode, chunk_size=load_chunk_size
+                    )
+        else:
+            if shard_kind == "Parquet":
+                preloaded_shards = {
+                    path: ParquetDataset(
+                        path,
+                        columns=input_file_keys,
+                        mode=load_mode,
+                        chunk_size=load_chunk_size
+                    ) for path in shard_files
+                }
+                # DO NOT DELETE.
+                # I will come back when collate_fn_ is a separate pickable function
+                # num_workers = 4
+                # prefetch_factor = 2
+                # persistent_workers = True
+            print(f"Found {nshards} dataset shards ({shard_kind}).")
             sharded_training = True
-
     else:
         raise ValueError(
-            f"Unknown dataset format. Supported formats: '.db', '.h5', '.pkl', '.pickle'"
+            "Unknown dataset format. Supported formats: '.db', '.h5', '.pkl', '.pickle', '.parquet'. "
         )
     print(" done.")
 
+    ### Log dataset in MLflow.
+    if log_dataset is not None:
+        log_dataset(dspath, dataset)
+
     ### BUILD DATALOADERS
-    # batch_size = training_parameters.get("batch_size", 16)
-    shuffle = training_parameters.get("shuffle_dataset", True)
+    # batch_size is passed explicitly by the caller.
+    shuffle = training_config.shuffle_dataset
+    num_workers = 0
+    prefetch_factor = None
+    if is_url: 
+        shuffle = None
+        num_workers = 1
+        prefetch_factor = training_config.batch_prefetch
+        print("Using num_workers=1 and prefetch_factor=",prefetch_factor," for HTTP dataset.")
+
+    loader_class = _PrefetchingDataLoader if is_url else DataLoader
     if train_val_split:
         if batch_size_val is None:
             batch_size_val = batch_size
-        dataloader_validation = DataLoader(
+        dataloader_validation = loader_class(
             dataset["validation"],
             batch_size=batch_size_val,
             shuffle=shuffle,
             collate_fn=collate_fn_valid,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
         )
 
     if sharded_training:
+
+        def _load_training_shard(path: str):
+            if path.endswith(".pkl") or path.endswith(".pickle"):
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            elif path.endswith(".parquet"):
+                return preloaded_shards[path]
+            else:
+                raise ValueError(f"Unsupported shard type: {path}")
 
         def iterate_sharded_dataset():
             indices = np.arange(nshards)
@@ -512,14 +638,16 @@ def load_dataset(
             for i in indices:
                 filename = shard_files[i]
                 print(f"# Loading dataset shard from {filename}...", end="")
-                with open(filename, "rb") as f:
-                    dataset = pickle.load(f)
+                dataset_shard = _load_training_shard(filename)
                 print(" done.")
                 dataloader = DataLoader(
-                    dataset,
+                    dataset_shard,
                     batch_size=batch_size,
                     shuffle=shuffle,
                     collate_fn=collate_fn_train,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
+                    persistent_workers=persistent_workers,
                 )
                 for batch in dataloader:
                     yield batch
@@ -530,11 +658,14 @@ def load_dataset(
 
         dataloader_training = DataLoaderSharded()
     else:
-        dataloader_training = DataLoader(
+        dataloader_training = loader_class(
             dataset["training"] if train_val_split else dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=collate_fn_train,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
 
     if not infinite_iterator:
@@ -555,9 +686,10 @@ def load_dataset(
 
 
 def load_model(
-    parameters: Dict[str, any],
-    model_file: Optional[str] = None,
-    rng_key: Optional[str] = None,
+    config_model: dict[str, Any] | None = None,
+    model_file: str | None = None,
+    rng_key: str | None = None,
+    print_model=False,
 ) -> FENNIX:
     """
     Load a FENNIX model from a file or create a new one.
@@ -566,32 +698,42 @@ def load_model(
         parameters (dict): A dictionary of parameters for the model.
         model_file (str, optional): The path to a saved model file to load.
 
+    Raise:
+
+        - FileNotFoundError: model_file given does not exist.
+        - ValueError: model_file is not given and no rng_key is provided
+            to build the model.
+        - ValueError: no model_file and no model configuration provided.
+
     Returns:
         FENNIX: A FENNIX model object.
     """
-    print_model = parameters["training"].get("print_model", False)
-    if model_file is None:
-        model_file = parameters.get("model_file", None)
-    if model_file is not None and os.path.exists(model_file):
-        model = FENNIX.load(model_file, use_atom_padding=False)
-        if print_model:
-            print(model.summarize())
-        print(f"Restored model from '{model_file}'.")
-    else:
-        assert (
-            rng_key is not None
-        ), "rng_key must be specified if model_file is not provided."
-        model_params = parameters["model"]
-        if isinstance(model_params, str):
-            assert os.path.exists(
-                model_params
-            ), f"Model file '{model_params}' not found."
-            model = FENNIX.load(model_params, use_atom_padding=False)
-            print(f"Restored model from '{model_params}'.")
+    # Load model from given file
+    if model_file is not None:
+        if os.path.exists(model_file):
+            print(f"Restored model from '{model_file}'.")
+            model = FENNIX.load(model_file, use_atom_padding=False)
         else:
-            model = FENNIX(**model_params, rng_key=rng_key, use_atom_padding=False)
-        if print_model:
-            print(model.summarize())
+            raise FileNotFoundError(f"Model file {model_file} not found.")
+
+        return model
+
+    # create model from config
+    elif config_model is not None:
+        if rng_key is None:
+            raise ValueError(
+                "rng_key must be specified if model_file is not provided.")
+        model = FENNIX(**config_model, rng_key=rng_key, use_atom_padding=False)
+
+    else:
+        raise ValueError(
+            "Configuration Error: No model file path and "
+            "no model definition found."
+        )
+
+    if print_model:
+        print(model.summarize())
+
     return model
 
 

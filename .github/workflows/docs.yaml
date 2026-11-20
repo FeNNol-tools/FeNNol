@@ -23,18 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
-      - run: pip install jax[cpu] pdoc e3nn-jax
-      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install -e .
-      - run: pdoc --docformat numpy -o ./docs -t ./pdoc_templates/ src/fennol/
+      # Default groups add training (CPU torch); the docs group adds pdoc, e3nn and mlflow.
+      - run: uv sync --locked --group docs
+      - run: uv run --group docs make doc
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/
+          path: docs/_build/
 
   # Deploy the artifact to GitHub pages.
   # This is a separate job so that only actions/deploy-pages has the necessary permissions.

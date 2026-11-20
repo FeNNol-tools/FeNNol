@@ -34,6 +34,40 @@ def _build_periodic_coordinates():
 
 PERIODIC_COORDINATES = _build_periodic_coordinates()
 
+def get_atomic_number(symbol: str) -> int:
+    """
+    Get the atomic number for a given atomic symbol.
+    It detects simple symbol extensions (e.g., 'CA' for alpha carbon,"K+" for potassium ion).
+
+    Parameters
+    ----------
+    symbol : str
+        Atomic symbol (e.g., 'H', 'He', 'Li', etc.)
+
+    Returns
+    -------
+    int
+        Atomic number corresponding to the symbol. Returns -1 if the symbol is not found.
+    """
+
+    __MINUSCULES = "abcdefghijklmnopqrstuvwxyz"
+    if symbol in PERIODIC_TABLE_REV_IDX:
+        return PERIODIC_TABLE_REV_IDX[symbol]
+
+    siz = len(symbol)
+
+    if siz > 2 and symbol[1] in __MINUSCULES:
+        base_symbol = symbol[:2]
+        if base_symbol in PERIODIC_TABLE_REV_IDX:
+            return PERIODIC_TABLE_REV_IDX[base_symbol]
+
+    if siz >= 2 and symbol[1] not in __MINUSCULES:
+        base_symbol = symbol[0]
+        if base_symbol in PERIODIC_TABLE_REV_IDX:
+            return PERIODIC_TABLE_REV_IDX[base_symbol]
+
+    return -1
+
 ATOMIC_MASSES = np.array([
     0.0,
     1.008,
@@ -1739,7 +1773,7 @@ VDW_RADII[112] = 4.10942
 VDW_RADII[113] = 4.13041
 VDW_RADII[114] = 4.16977
 VDW_RADII[115] = 4.6919
-VDW_RADII[116] = np.nan
+VDW_RADII[116] = 4.7166 # not tabulated, estimated as 0.5*(r115 + r117)
 VDW_RADII[117] = 4.7413
 VDW_RADII[118] = 4.56067
 

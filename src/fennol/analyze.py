@@ -1,4 +1,4 @@
-import sys, os, io
+import sys, io
 import argparse
 from pathlib import Path
 
@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from .models import FENNIX
 from .utils import parse_cell
 from .utils.io import xyz_reader,human_time_duration
+from .utils.device import configure_device, resolve_device
 from .utils.periodic_table import PERIODIC_TABLE_REV_IDX
 from .utils.atomic_units import AtomicUnits as au
 import yaml
@@ -17,9 +18,67 @@ from flax.core import freeze, unfreeze
 import time
 import multiprocessing as mp
 
+def _queue_reader(queue, outfile, out_format):
+    def make_dumpable(data):
+        for k in data:
+            if isinstance(data[k], np.ndarray):
+                data[k] = data[k].tolist()
+        return data
+
+    if outfile is not None:
+        if out_format == "yaml":
+            of = open(outfile, "w")
+            def dump(data):
+                of.write("\n---\n")
+                i=yaml.dump(make_dumpable(data), of, sort_keys=False)
+                of.flush()
+                return i
+        elif out_format == "pkl":
+            of = open(outfile, "wb")
+            def dump(data):
+                i=pickle.dump(data,of)
+                of.flush()
+                return i
+        elif out_format == "h5":
+            import h5py
+            of = h5py.File(outfile, "w")
+            global iframeh5
+            iframeh5 = 0  # start from frame 1
+            def dump(data):
+                global iframeh5
+                of.create_group(f'{iframeh5}', track_order=True)
+                for k in data:
+                    of[f"{iframeh5}/{k}"] = data[k]
+                iframeh5 += 1
+                return None
+        elif out_format == "mpk":
+            import msgpack
+            of = open(outfile, "wb")
+            def dump(data):
+                i=msgpack.pack(make_dumpable(data), of)
+                of.flush()
+                return i
+        else:
+            raise ValueError(f"Unsupported output file format {out_format}")
+    else:
+        def dump(data):
+            print("\n---\n")
+            data = make_dumpable(data)
+            for k in data:
+                print(f"{k}: {data[k]}")
+            return None
+    while True:
+        data = queue.get()
+        if data is None:
+            break
+        dump(data)
+    if outfile is not None:
+        of.close()
+
+
 def get_file_reader(input_file,file_format=None,has_comment_line=True, periodic=False):
     # check the input file
-    input_file = Path(input_file).resolve()
+    input_file = Path(input_file).expanduser().resolve()
     assert input_file.exists(), f"Input file {input_file} does not exist"
     # assert args.format == "xyz", f"Only xyz format is supported for now"
     if file_format is None:
@@ -131,7 +190,11 @@ def fennix_analyzer(input_file, model, output_keys,file_format=None,periodic=Fal
 
         inputs["flags"] = flags
 
-        if "forces" in output_keys:
+        if "virial_tensor" in output_keys or "virial" in output_keys:
+            e,f,vir, output = model.energy_and_forces_and_virial(**inputs,gpu_preprocessing=True)
+            if "virial" in output_keys:
+                output["virial"] = output["virial_tensor"]
+        elif "forces" in output_keys:
             e, f, output = model.energy_and_forces(**inputs,gpu_preprocessing=True)
         else:
             e, output = model.total_energy(**inputs,gpu_preprocessing=True)
@@ -260,29 +323,13 @@ def main():
         default=[],
         help="additional flags to pass to the model. These will be added to the inputs as a dictionary with the flag name as key and None as value.",
     )
+    parser.add_argument("--dump_preproc_state", type=Path)
+    parser.add_argument("--read_preproc_state", type=Path)
     args = parser.parse_args()
 
     # set the device
-    if args.device:
-        device = args.device.lower()
-    elif "FENNOL_DEVICE" in os.environ:
-        device = os.environ["FENNOL_DEVICE"].lower()
-        print(f"# Setting device from env FENNOL_DEVICE={device}")
-    else:
-        device = "cpu"
-    if device == "cpu":
-        jax.config.update("jax_platforms", "cpu")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    elif device.startswith("cuda") or device.startswith("gpu"):
-        if ":" in device:
-            num = device.split(":")[-1]
-            os.environ["CUDA_VISIBLE_DEVICES"] = num
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        device = "gpu"
-
-    _device = jax.devices(device)[0]
-    jax.config.update("jax_default_device", _device)
+    device = resolve_device(cli=args.device)
+    configure_device(device)
 
     # set the precision
     if args.f64:
@@ -295,35 +342,40 @@ def main():
     output_keys = args.output_keys
 
     # load the model
-    model_file: Path = args.model_file.resolve()
+    model_file: Path = args.model_file.expanduser().resolve()
     assert model_file.exists(), f"Model file {model_file} does not exist"
     model = FENNIX.load(model_file, use_atom_padding=True)
 
-    preproc_state = unfreeze(model.preproc_state)
-    layer_state = []
-    for st in preproc_state["layers_state"]:
-        stnew = unfreeze(st)
-        # if "nblist_mult_size" in training_parameters:
-        #     stnew["nblist_mult_size"] = training_parameters["nblist_mult_size"]
-        # if "nblist_add_neigh" in training_parameters:
-        #     stnew["add_neigh"] = training_parameters["nblist_add_neigh"]
-        # if "nblist_add_atoms" in training_parameters:
-        #     stnew["add_atoms"] = training_parameters["nblist_add_atoms"]
-        if args.nblist is not None:
-            mult_size, add_neigh, add_atoms = args.nblist
-            stnew["nblist_mult_size"] = float(mult_size)
-            stnew["add_neigh"] = int(add_neigh)
-            stnew["add_atoms"] = int(add_atoms)
-        layer_state.append(freeze(stnew))
+    if args.read_preproc_state is not None:
+        with open(args.read_preproc_state,"rb") as f:
+            preproc_state = pickle.load(f)
+    else:
+        preproc_state = unfreeze(model.preproc_state)
+        layer_state = []
+        for st in preproc_state["layers_state"]:
+            stnew = unfreeze(st)
+            # if "nblist_mult_size" in training_parameters:
+            #     stnew["nblist_mult_size"] = training_parameters["nblist_mult_size"]
+            # if "nblist_add_neigh" in training_parameters:
+            #     stnew["add_neigh"] = training_parameters["nblist_add_neigh"]
+            # if "nblist_add_atoms" in training_parameters:
+            #     stnew["add_atoms"] = training_parameters["nblist_add_atoms"]
+            if args.nblist is not None:
+                mult_size, add_neigh, add_atoms = args.nblist
+                stnew["nblist_mult_size"] = float(mult_size)
+                stnew["add_neigh"] = int(add_neigh)
+                stnew["add_atoms"] = int(add_atoms)
+            layer_state.append(freeze(stnew))
 
-    preproc_state["layers_state"] = tuple(layer_state)
-    preproc_state["check_input"] = False
+        preproc_state["layers_state"] = tuple(layer_state)
+        preproc_state["check_input"] = False
+
     model.preproc_state = freeze(preproc_state)
     # model.preproc_state = model.preproc_state.copy({"check_input": False})
 
     # check the output file
     if args.outfile is not None:
-        output_file: Path = args.outfile.resolve()
+        output_file: Path = args.outfile.expanduser().resolve()
         assert not output_file.exists(), f"Output file {args.outfile} already exists"
         out_format = output_file.suffix.lower()[1:]
         if out_format == "yml":
@@ -354,65 +406,9 @@ def main():
     for k, v in metadata.items():
         print(f"  {k}: {v}")
 
-    def make_dumpable(data):
-        for k in data:
-            if isinstance(data[k], np.ndarray):
-                data[k] = data[k].tolist()
-        return data
-    
-    def queue_reader(queue):
-        if args.outfile is not None:
-            if out_format == "yaml":
-                of = open(args.outfile, "w")
-                def dump(data):
-                    of.write("\n---\n")
-                    i=yaml.dump(make_dumpable(data), of, sort_keys=False)
-                    of.flush()
-                    return i
-            elif out_format == "pkl":
-                of = open(args.outfile, "wb")
-                def dump(data):
-                    i=pickle.dump(data,of)
-                    of.flush()
-                    return i
-            elif out_format == "h5":
-                import h5py
-                of = h5py.File(args.outfile, "w")
-                global iframeh5
-                iframeh5 = 0  # start from frame 1
-                def dump(data):
-                    global iframeh5
-                    of.create_group(f'{iframeh5}', track_order=True)
-                    for k in data:
-                        of[f"{iframeh5}/{k}"] = data[k]
-                    iframeh5 += 1
-                    return None
-            elif out_format == "mpk":
-                import msgpack
-                of = open(args.outfile, "wb")
-                def dump(data):
-                    i=msgpack.pack(make_dumpable(data), of)
-                    of.flush()
-                    return i
-            else:
-                raise ValueError(f"Unsupported output file format {out_format}")
-        else:
-            def dump(data):
-                print("\n---\n")
-                data = make_dumpable(data)
-                for k in data:
-                    print(f"{k}: {data[k]}")
-                return None
-        while True:
-            data = queue.get()
-            if data is None:
-                break
-            dump(data)
-        if args.outfile is not None:
-            of.close()
     # create a multiprocessing queue to dump the output
     queue = mp.Queue()
-    p = mp.Process(target=queue_reader, args=(queue,))
+    p = mp.Process(target=_queue_reader, args=(queue, args.outfile, out_format if args.outfile is not None else None))
     p.start()
     if args.metadata and args.outfile is not None:
         queue.put(metadata)
@@ -444,6 +440,11 @@ def main():
     except Exception as err:
         error = err
         print(f"# Exiting with Exception: {error}")
+    finally:
+        if args.dump_preproc_state is not None:
+            print("Dumping preproc state")
+            with open(args.dump_preproc_state,"wb") as f:
+                pickle.dump(model.preproc_state,f)
 
     # wait for the process to finish
     queue.put(None)

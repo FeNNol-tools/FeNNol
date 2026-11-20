@@ -1,6 +1,7 @@
 import time
 import numpy as np
 from . import cell_vectors_to_lengths_angles, parse_cell
+from .periodic_table import get_atomic_number
 
 def xyz_reader(
     filename,
@@ -73,7 +74,11 @@ def xyz_reader(
                 raise Exception("Error: line does not start with an integer index!")
             iat, s = (iat+1, 0)
         # iat, s = (int(ls[0]), 1) if indexed else (iat + 1, 0)
-        symbols.append(ls[s])
+        symbol = ls[s]
+        species = get_atomic_number(symbol)
+        if species <= 0:
+            raise Exception(f"Error: unrecognized atomic symbol '{symbol}'")
+        symbols.append(symbol)
         xyz[iat - 1, :] = np.array([ls[s + 1], ls[s + 2], ls[s + 3]], dtype="float")
         if at_count == nat:
             iframe += 1
@@ -112,7 +117,7 @@ def read_xyz(
 def last_xyz_frame(filename, has_comment_line=True, indexed=False):
     last_frame = None
     for frame in xyz_reader(
-        filename, has_comment_line, indexed, start=-1, stop=-1, step=1, max_frames=1
+        filename, has_comment_line, indexed, start=1, stop=-1, step=1
     ):
         last_frame = frame
     return last_frame

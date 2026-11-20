@@ -21,6 +21,10 @@ class ChargeHypothesis(nn.Module):
     """Key for the charges in the outputs"""
     total_charge_key: str = "total_charge"
     """Key for the total charge in the inputs"""
+    ref_charges_key: Optional[str] = None
+    """Key for the reference charges in the inputs."""
+    wscale_key: Optional[str] = None
+    """Key for the weight scaling in the inputs."""
     ncharges: int = 10
     """The number of charge hypothesis"""
     mode: str = "qeq"
@@ -38,10 +42,15 @@ class ChargeHypothesis(nn.Module):
         wi = jax.nn.softplus(
             nn.Dense(self.ncharges, use_bias=True, name="wi",kernel_init=kernel_init)(embedding)
         )
+        if self.wscale_key is not None and self.wscale_key in inputs:
+            wscale = jnp.abs(inputs[self.wscale_key].astype(wi.dtype))
+            if wscale.ndim == 1:
+                wscale = wscale[:, None]
+            wi = wi * wscale
+        wi = jnp.clip(wi, min=1e-6)
 
         batch_index = inputs["batch_index"]
         nsys = inputs["natoms"].shape[0]
-        wtot = jax.ops.segment_sum(wi, batch_index, nsys)
 
         Qtot = (
             inputs[self.total_charge_key].astype(wi.dtype)
@@ -53,13 +62,29 @@ class ChargeHypothesis(nn.Module):
 
         
         qtilde = nn.Dense(self.ncharges, use_bias=True, name="qi",kernel_init=kernel_init)(embedding)
+        if self.ref_charges_key is not None and self.ref_charges_key in inputs:
+            qref = inputs[self.ref_charges_key].astype(qtilde.dtype)
+            if qref.ndim == 1:
+                qref = qref[:, None]
+            qtilde = qtilde + qref
+
+
+        wtot = jax.ops.segment_sum(wi, batch_index, nsys) + 1e-10
         qtot = jax.ops.segment_sum(qtilde, batch_index, nsys)
         dq = Qtot[:, None] - qtot
         f = (dq / wtot)[batch_index]
 
-        if "alch_group" in inputs:
+        flags = inputs.get("flags", {})
+        no_charge_decoupling = "alch_no_charge_decoupling" in flags
+        do_charge_decoupling =  not no_charge_decoupling
+
+        if "alch_group" in inputs and do_charge_decoupling:
             alch_group = inputs["alch_group"]
-            lambda_e = inputs["alch_elambda"]
+            alch_independent_charges = "alch_independent_charges" in flags
+            if alch_independent_charges:
+                lambda_e = 0.
+            else:
+                lambda_e = inputs["alch_elambda"]
             Qligand = inputs.get("alch_ligand_charge", jnp.zeros(nsys))
             if Qligand.ndim == 0:
                 Qligand = Qligand * jnp.ones(nsys, dtype=wi.dtype)

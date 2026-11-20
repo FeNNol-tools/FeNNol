@@ -576,7 +576,7 @@ class QeqD4(nn.Module):
                 q0 = -chi*si
                 qtot = jax.ops.segment_sum(q0,batch_index,nsys)
                 sisum = jax.ops.segment_sum(si,batch_index,nsys)
-                l0 = sisum*(qtot - Qtot)
+                l0 = (qtot - Qtot) / sisum
                 q0 = q0 - si*l0[batch_index]
                 x0 = jnp.concatenate((l0,q0))
             else:

@@ -128,12 +128,20 @@ class GraphGenerator:
         else:
             cells = np.array(inputs["cells"], dtype=np.float32)
             reciprocal_cells = np.array(inputs["reciprocal_cells"], dtype=np.float32)
+            use_cell_mask = "cells_mask" in inputs
+            if use_cell_mask:
+                cells_mask = np.array(inputs["cells_mask"],dtype=bool).reshape(cells.shape[0],)
+            else:
+                cells_mask = True
+
             if minimage:
                 ## MINIMUM IMAGE CONVENTION
                 vec = coords[p2] - coords[p1]
                 if cells.shape[0] == 1:
                     vecpbc = np.dot(vec, reciprocal_cells[0])
                     pbc_shifts = -np.round(vecpbc).astype(np.int32)
+                    if use_cell_mask:
+                        pbc_shifts = pbc_shifts * cells_mask[0]
                     vec = vec + np.dot(pbc_shifts, cells[0])
                 else:
                     batch_index_vec = batch_index[p1]
@@ -141,6 +149,8 @@ class GraphGenerator:
                         "aj,aji->ai", vec, reciprocal_cells[batch_index_vec]
                     )
                     pbc_shifts = -np.round(vecpbc).astype(np.int32)
+                    if use_cell_mask:
+                        pbc_shifts = pbc_shifts * cells_mask[batch_index_vec][:, None]
                     vec = vec + np.einsum(
                         "aj,aji->ai", pbc_shifts, cells[batch_index_vec]
                     )
@@ -150,12 +160,16 @@ class GraphGenerator:
                 if cells.shape[0] == 1:
                     coords_pbc = np.dot(coords, reciprocal_cells[0])
                     at_shifts = -np.floor(coords_pbc).astype(np.int32)
+                    if use_cell_mask:
+                        at_shifts = at_shifts * cells_mask[0]
                     coords_pbc = coords + np.dot(at_shifts, cells[0])
                 else:
                     coords_pbc = np.einsum(
                         "aj,aji->ai", coords, reciprocal_cells[batch_index]
                     )
                     at_shifts = -np.floor(coords_pbc).astype(np.int32)
+                    if use_cell_mask:
+                        at_shifts = at_shifts * cells_mask[batch_index][:, None]
                     coords_pbc = coords + np.einsum(
                         "aj,aji->ai", at_shifts, cells[batch_index]
                     )
@@ -167,6 +181,8 @@ class GraphGenerator:
                 num_repeats_all = np.ceil(cdinv).astype(np.int32)
                 if "true_sys" in inputs:
                     num_repeats_all = np.where(np.array(inputs["true_sys"],dtype=bool)[:, None], num_repeats_all, 0)
+                if use_cell_mask:
+                    num_repeats_all = np.where(cells_mask[:,None], num_repeats_all, 0)
                 # num_repeats_all = np.where(cdinv < 0.5, 0, num_repeats_all)
                 num_repeats = np.max(num_repeats_all, axis=0)
                 num_repeats_prev = np.array(state.get("num_repeats_pbc", (0, 0, 0)))
@@ -371,6 +387,7 @@ class GraphGenerator:
             graph_out["edge_dst_skin"] = edge_dst_skin
             if apply_pbc:
                 graph_out["pbc_shifts_skin"] = pbc_shifts_skin
+                graph_out["coordinates_skin"] = coords
 
         if self.k_space and apply_pbc:
             if "k_points" not in graph:
@@ -444,29 +461,39 @@ class GraphGenerator:
         else:
             cells = inputs["cells"]
             reciprocal_cells = inputs["reciprocal_cells"]
+            use_cell_mask = "cells_mask" in inputs
+            if use_cell_mask:
+                cells_mask = inputs["cells_mask"].reshape(cells.shape[0],)
+            else:
+                cells_mask = None
+
             # minimage = state.get("minimum_image", True)
             minimage = "minimum_image" in inputs.get("flags", {})
 
-            def compute_pbc(vec, reciprocal_cell, cell, mode="round"):
-                vecpbc = jnp.dot(vec, reciprocal_cell)
+            def compute_pbc(vec, reciprocal_cell, cell, mode="round",mask=None):
+                _dot = jnp.dot if cell.ndim == 2 else jax.vmap(jnp.dot)
+                vecpbc = _dot(vec, reciprocal_cell)
                 if mode == "round":
                     pbc_shifts = -jnp.round(vecpbc).astype(jnp.int32)
                 elif mode == "floor":
                     pbc_shifts = -jnp.floor(vecpbc).astype(jnp.int32)
                 else:
                     raise NotImplementedError(f"Unknown mode {mode} for compute_pbc.")
-                return vec + jnp.dot(pbc_shifts, cell), pbc_shifts
+                if mask is not None:
+                    pbc_shifts = pbc_shifts * mask[..., None]
+                return vec + _dot(pbc_shifts, cell), pbc_shifts
 
             if minimage:
                 ## minimum image convention
                 vec = coords[p2] - coords[p1]
 
                 if cells.shape[0] == 1:
-                    vec, pbc_shifts = compute_pbc(vec, reciprocal_cells[0], cells[0])
+                    vec, pbc_shifts = compute_pbc(vec, reciprocal_cells[0], cells[0],mask=cells_mask)
                 else:
                     batch_index_vec = batch_index[p1]
-                    vec, pbc_shifts = jax.vmap(compute_pbc)(
-                        vec, reciprocal_cells[batch_index_vec], cells[batch_index_vec]
+                    cells_mask_vec = cells_mask[batch_index_vec] if use_cell_mask else None
+                    vec, pbc_shifts = compute_pbc(
+                        vec, reciprocal_cells[batch_index_vec], cells[batch_index_vec],mask=cells_mask_vec
                     )
             else:
                 ### general PBC only for single cell yet
@@ -480,12 +507,11 @@ class GraphGenerator:
                 ## put all atoms in central box
                 if cells.shape[0] == 1:
                     coords_pbc, at_shifts = compute_pbc(
-                        coords, reciprocal_cells[0], cells[0], mode="floor"
+                        coords, reciprocal_cells[0], cells[0], mode="floor",mask=cells_mask
                     )
                 else:
-                    coords_pbc, at_shifts = jax.vmap(
-                        partial(compute_pbc, mode="floor")
-                    )(coords, reciprocal_cells[batch_index], cells[batch_index])
+                    cells_mask_at = cells_mask[batch_index] if use_cell_mask else None
+                    coords_pbc, at_shifts = compute_pbc(coords, reciprocal_cells[batch_index], cells[batch_index], mode="floor",mask=cells_mask_at)
                 vec = coords_pbc[p2] - coords_pbc[p1]
                 num_repeats = state.get("num_repeats_pbc", (0, 0, 0))
                 # if num_repeats is None:
@@ -498,6 +524,8 @@ class GraphGenerator:
                 num_repeats_all = jnp.ceil(cdinv).astype(jnp.int32)
                 if "true_sys" in inputs:
                     num_repeats_all = jnp.where(inputs["true_sys"][:,None], num_repeats_all, 0)
+                if use_cell_mask:
+                    num_repeats_all = jnp.where(cells_mask[:,None], num_repeats_all, 0)
                 num_repeats_new = jnp.max(num_repeats_all, axis=0)
                 overflow_repeats = jnp.any(num_repeats_new > jnp.asarray(num_repeats))
 
@@ -688,6 +716,7 @@ class GraphGenerator:
             graph_out["edge_dst_skin"] = edge_dst_skin
             if "cells" in inputs:
                 graph_out["pbc_shifts_skin"] = pbc_shifts_skin
+                graph_out["coordinates_skin"] = coords
 
         if self.k_space and "cells" in inputs:
             if "k_points" not in graph:
@@ -708,14 +737,41 @@ class GraphGenerator:
             mode="fill", fill_value=self.cutoff
         ) - coords.at[edge_src_skin].get(mode="fill", fill_value=0.0)
 
+        graph_out = {}
         if "cells" in inputs:
             pbc_shifts_skin = graph["pbc_shifts_skin"]
             cells = inputs["cells"]
+            if "coordinates_skin" in graph:
+                # Coordinates are wrapped during dynamics. Track integer cell
+                # crossings since the previous skin update and adjust image
+                # shifts so the reused edges continue to represent the same
+                # physical neighbor vectors.
+                reciprocal_cells = inputs["reciprocal_cells"]
+                if cells.shape[0] == 1:
+                    delta_fractional = jnp.dot(
+                        coords - graph["coordinates_skin"], reciprocal_cells[0]
+                    )
+                else:
+                    delta_fractional = jax.vmap(jnp.dot)(
+                        coords - graph["coordinates_skin"],
+                        reciprocal_cells[inputs["batch_index"]],
+                    )
+                crossings = -jnp.round(delta_fractional).astype(jnp.int32)
+                crossing_dst = crossings.at[edge_dst_skin].get(
+                    mode="fill", fill_value=0
+                )
+                crossing_src = crossings.at[edge_src_skin].get(
+                    mode="fill", fill_value=0
+                )
+                pbc_shifts_skin = pbc_shifts_skin + crossing_dst - crossing_src
+                graph_out["coordinates_skin"] = coords
+
             if cells.shape[0] == 1:
                 vec = vec + jnp.dot(pbc_shifts_skin, cells[0])
             else:
                 batch_index_vec = inputs["batch_index"][edge_src_skin]
                 vec = vec + jax.vmap(jnp.dot)(pbc_shifts_skin, cells[batch_index_vec])
+            graph_out["pbc_shifts_skin"] = pbc_shifts_skin
 
         nat = coords.shape[0]
         d12 = jnp.sum(vec**2, axis=-1)
@@ -738,6 +794,7 @@ class GraphGenerator:
         overflow = graph.get("overflow", False) | (npairs > max_pairs)
         graph_out = {
             **graph,
+            **graph_out,
             "edge_src": edge_src,
             "edge_dst": edge_dst,
             "d12": d12,
@@ -764,6 +821,9 @@ class GraphProcessor(nn.Module):
     - pbcs_shifts: pbc shifts for the edges (only if `cells` are present in the inputs)
 
     This module is automatically added to a FENNIX model when a GraphGenerator is used.
+
+    With alchemical distances, beta_alch is the coefficient in
+    r_soft**2 = alpha + beta_alch * r_raw**2 for direct-force chain rules.
 
     """
 
@@ -826,10 +886,10 @@ class GraphProcessor(nn.Module):
             else:
                 alch_alpha = (1-lambda_v)*inputs.get("alch_softcore_v",0.5)**2
 
+            beta = 1. - alch_alpha / self.cutoff**2
+            graph_out["beta_alch"] = beta
             graph_out["distances"] = jnp.where(
-                mask,
-                distances,
-                safe_sqrt(alch_alpha + d2 * (1. - alch_alpha/self.cutoff**2))
+                mask, distances, safe_sqrt(alch_alpha + d2 * beta)
             )  
 
 
@@ -1034,6 +1094,9 @@ class GraphFilterProcessor(nn.Module):
     """Filter processing for a pre-generated graph
 
     This module is automatically added to a FENNIX model when a GraphFilter is used.
+
+    Alchemical distances and beta_alch follow GraphProcessor's conventions,
+    evaluated at this graph's cutoff using the parent's raw distances.
     """
 
     cutoff: float
@@ -1050,7 +1113,7 @@ class GraphFilterProcessor(nn.Module):
         graph_in = inputs[self.parent_graph]
         graph = inputs[self.graph_key]
 
-        d_key = "distances_raw" if "distances_raw" in graph else "distances"
+        d_key = "distances_raw" if "distances_raw" in graph_in else "distances"
 
         if graph_in["vec"].shape[0] == 0:
             vec = graph_in["vec"]
@@ -1103,10 +1166,10 @@ class GraphFilterProcessor(nn.Module):
             else:
                 alch_alpha = (1-lambda_v)*inputs.get("alch_softcore_v",0.5)**2
 
+            beta = 1. - alch_alpha / self.cutoff**2
+            graph_out["beta_alch"] = beta
             graph_out["distances"] = jnp.where(
-                mask,
-                distances,
-                safe_sqrt(alch_alpha + distances**2 * (1. - alch_alpha/self.cutoff**2))
+                mask, distances, safe_sqrt(alch_alpha + distances**2 * beta)
             )  
             
 

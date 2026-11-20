@@ -5,6 +5,7 @@ import flax.linen as nn
 import numpy as np
 from typing import Any, Dict, Union, Callable, Sequence, Optional, ClassVar
 from ...utils.atomic_units import au
+from ._direct_forces import repulsion_outputs
 
 
 class RepulsionZBL(nn.Module):
@@ -26,6 +27,12 @@ class RepulsionZBL(nn.Module):
     """Whether the parameters are trainable."""
     _energy_unit: str = "Ha"
     """The energy unit of the model. **Automatically set by FENNIX**"""
+    direct_forces_key: Optional[str] = None
+    """Optional force key; also writes <key>_virial_tensor.
+
+    Direct forces switch the radial force, omitting the derivative of the
+    switch. Units are model energy/Angstrom and model energy, respectively.
+    """
     proportional_regularization: bool = True
     d: float = 0.46850
     p: float = 0.23
@@ -137,6 +144,17 @@ class RepulsionZBL(nn.Module):
         output = {**inputs, energy_key: erep_atomic * energy_unit}
         if self.trainable and training:
             output[energy_key + "_regularization"] = reg
+        if self.direct_forces_key is not None:
+            rates = (Zp[edge_src] + Zp[edge_dst])[:, None] * alphas[None, :]
+            dphi = -(
+                rates * cs[None, :] * jnp.exp(-alphas[None, :] * x[:, None])
+            ).sum(axis=-1)
+            output.update(
+                repulsion_outputs(
+                    inputs, graph, Zij * (dphi / rijs - phi / rijs**2), rijs, switch,
+                    self.direct_forces_key, energy_unit,
+                )
+            )
 
         return output
 
@@ -160,6 +178,12 @@ class RepulsionNLH(nn.Module):
     """The energy unit of the model. **Automatically set by FENNIX**"""
     trainable: bool = False
     direct_forces_key: Optional[str] = None
+    """Optional force key; also writes <key>_virial_tensor.
+
+    Direct forces switch the radial force, omitting the derivative of the
+    switch. Units are model energy/Angstrom and model energy, respectively.
+    """
+    use_corrected_NaO: bool = False
 
     FID: ClassVar[str] = "REPULSION_NLH"
 
@@ -168,13 +192,18 @@ class RepulsionNLH(nn.Module):
 
         path = str(pathlib.Path(__file__).parent.resolve()) + "/nlh_coeffs.dat"
         DATA_NLH = np.loadtxt(path, usecols=np.arange(0, 8))
-        zmax = int(np.max(DATA_NLH[:, 0]))
+        zmax = 118 #int(np.max(DATA_NLH[:, 0]))
         AB = np.zeros(((zmax + 1) ** 2, 6), dtype=np.float32)
         for i in range(DATA_NLH.shape[0]):
             z1 = int(DATA_NLH[i, 0])
             z2 = int(DATA_NLH[i, 1])
-            AB[z1 + zmax * z2] = DATA_NLH[i, 2:8]
-            AB[z2 + zmax * z1] = DATA_NLH[i, 2:8]
+            if self.use_corrected_NaO and ((z1 == 11 and z2 == 8) or (z1 == 8 and z2 == 11)):
+                ABcorr = np.array([0.16691,27.14183,0.69924,4.94580,0.13385,2.70748	])
+                AB[z1 + zmax * z2,:] = ABcorr
+                AB[z2 + zmax * z1,:] = ABcorr
+            else:
+                AB[z1 + zmax * z2] = DATA_NLH[i, 2:8]
+                AB[z2 + zmax * z1] = DATA_NLH[i, 2:8]
         AB = AB.reshape((zmax + 1) ** 2, 3, 2)
 
         species = inputs["species"]
@@ -195,7 +224,10 @@ class RepulsionNLH(nn.Module):
                 )
             )
             CS = CS * cfact[None, :]
-            CS = CS / jnp.sum(CS, axis=1, keepdims=True)
+            normalization = jnp.sum(CS, axis=1, keepdims=True)
+            # Empty coefficient rows include padding species. Keep them zero
+            # rather than introducing 0/0 into parameter gradients.
+            CS = CS / jnp.where(normalization > 0, normalization, 1.0)
             alphas_fact = jnp.abs(
                 self.param(
                     "alpha_fact",
@@ -224,11 +256,15 @@ class RepulsionNLH(nn.Module):
                 switch,
                 (lambda_v**alch_m) * switch,
             )
-            # alphas = jnp.where(
-            #     mask[:,None],
-            #     alphas,
-            #     lambda_v * alphas ,
-            # )
+            if "alch_ascale_rep" in inputs:
+                ascale = 1./inputs["alch_ascale_rep"]**0.5
+                lambda_e = inputs["alch_elambda"]
+                lambda_e = 0.5 * (1 - jnp.cos(jnp.pi * lambda_e))
+                alphas = jnp.where(
+                    mask[:,None],
+                    alphas,
+                    alphas * (lambda_e + ascale* (1 - lambda_e))
+                )
         else:
             switch = graph["switch"]
 
@@ -248,11 +284,12 @@ class RepulsionNLH(nn.Module):
 
         if self.direct_forces_key is not None:
             dphidr = -(alphas * cs * jnp.exp(-alphas * rijs[:, None])).sum(axis=-1)
-            dedr = Zij * (dphidr / rijs - phi / (rijs**2))
-            dedij = (dedr / rijs)[:, None] * graph["vec"]
-            fi = (energy_unit * au.ANG) * jax.ops.segment_sum(
-                dedij, edge_src, species.shape[0]
+            zpair = Z[edge_src] * Z[edge_dst]
+            output.update(
+                repulsion_outputs(
+                    inputs, graph, zpair * (dphidr / rijs - phi / rijs**2), rijs, switch,
+                    self.direct_forces_key, 0.5 * energy_unit * au.ANG,
+                )
             )
-            output[self.direct_forces_key] = fi
 
         return output

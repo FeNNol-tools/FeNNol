@@ -21,6 +21,7 @@ import re
 from optax._src import base
 from optax._src import wrappers
 from optax import tree_utils as otu
+from .config import TrainingConfig
 
 
 class AddWeightDiffState(NamedTuple):
@@ -95,15 +96,13 @@ def profit(
     main_opt_params = {"learning_rate": learning_rate, **main_opt_params}
     main_opt = eval(
         main_opt,
-        {"__builtins__": None},
-        {**optax.__dict__},
+        {"__builtins__": None, **optax.__dict__},
     )(**main_opt_params)
 
     internal_opt_params = {"learning_rate": 0.1, **internal_opt_params}
     internal_opt = eval(
         internal_opt,
-        {"__builtins__": None},
-        {**optax.__dict__},
+        {"__builtins__": None, **optax.__dict__},
     )(**internal_opt_params)
 
     def init_fn(params):
@@ -236,13 +235,13 @@ def multi_ema(
 
 
 def get_optimizer(
-    training_parameters: Dict[str, any], variables: Dict, initial_lr: float
-) -> optax.GradientTransformation:
+    training_config: TrainingConfig, variables: Dict, initial_lr: float
+) -> tuple[optax.GradientTransformation, int]:
     """
     Returns an optax.GradientTransformation object that can be used to optimize the model parameters.
 
     Args:
-    - training_parameters: A dictionary containing the training parameters.
+    - training_config: Validated training configuration.
     - variables: A  pytree containing the model parameters.
     - initial_lr: The initial learning rate.
 
@@ -250,15 +249,15 @@ def get_optimizer(
     - An optax.GradientTransformation object that can be used to optimize the model parameters.
     """
 
-    default_status = str(training_parameters.get("default_status", "trainable")).lower()
+    default_status = training_config.default_status.lower()
     assert default_status in [
         "trainable",
         "frozen",
     ], f"Default status must be 'trainable' or 'frozen', got {default_status}"
 
     # find frozen and trainable parameters
-    frozen = training_parameters.get("frozen", [])
-    trainable = training_parameters.get("trainable", [])
+    frozen = training_config.frozen
+    trainable = training_config.trainable
 
     def training_status(full_path, v):
         full_path = "/".join(full_path[1:]).lower()
@@ -283,13 +282,13 @@ def get_optimizer(
     grad_processing = []
 
     # zero nans
-    zero_nans = training_parameters.get("zero_nans", False)
+    zero_nans = training_config.zero_nans
     if zero_nans:
         grad_processing.append(optax.zero_nans())
 
     # gradient clipping
-    clip_threshold = training_parameters.get("gradient_clipping", -1.0)
-    clip_range = str(training_parameters.get("clipping_range", "global")).lower()
+    clip_threshold = training_config.gradient_clipping
+    clip_range = training_config.clipping_range.lower()
     if clip_threshold > 0.0:
         print("gradient norm clipping threshold:", clip_threshold)
         if clip_range == "local":
@@ -299,36 +298,60 @@ def get_optimizer(
         elif clip_range == "block":
             _clip = optax.clip_by_block_rms
         else:
-            raise ValueError(f"Invalid gradnorm_clipping_range: {clip_range}. Should be 'local', 'global' or 'block'.")
+            raise ValueError(
+                f"Invalid gradnorm_clipping_range: {clip_range}. Should be 'local', 'global' or 'block'."
+            )
 
         grad_processing.append(_clip(clip_threshold))
 
-    use_grokfast = training_parameters.get("use_grokfast", False)
+    use_grokfast = training_config.use_grokfast
     if use_grokfast:
         print("Using Grokfast")
-        alpha_grokfast = training_parameters.get("alpha_grokfast", 0.9)
-        l_grokfast = training_parameters.get("l_grokfast", 1.0)
+        alpha_grokfast = training_config.alpha_grokfast
+        l_grokfast = training_config.l_grokfast
         grad_processing.append(add_grokfast(alpha=alpha_grokfast, l=l_grokfast))
 
     # OPTIMIZER
-    optimizer_name = training_parameters.get("optimizer", "adabelief")
-    optimizer = eval(
-        optimizer_name,
-        {"__builtins__": None},
-        {
-            **optax.__dict__,
-            "profit": profit,
-        },
-    )
+    optimizer_name = training_config.optimizer
+    try:
+        optimizer = eval(
+            optimizer_name,
+            {
+                "__builtins__": None,
+                **optax.__dict__,
+                **optax.contrib.__dict__,
+                "profit": profit,
+            },
+        )
+    except Exception as e:
+        raise ValueError(f"Invalid optimizer {optimizer_name}: {e}")
     print("Optimizer:", optimizer_name)
-    optimizer_configuration = training_parameters.get("optimizer_config", {})
+    optimizer_configuration = dict(training_config.optimizer_config)
     optimizer_configuration["learning_rate"] = 1.0
+    if "muon_exclude" in optimizer_configuration:
+        from optax.contrib import MuonDimensionNumbers
+
+        muon_exclude = optimizer_configuration.pop("muon_exclude")
+
+        def muon_mask(full_path, v):
+            full_path = "/".join(full_path).lower()
+            status = MuonDimensionNumbers() if v.ndim == 2 else None
+            for path in muon_exclude:
+                if re.match(r"^params\/" + path.lower(), full_path):
+                    status = None
+            return status
+
+        muon_mask_tree = traverse_util.path_aware_map(muon_mask, variables)
+        print("Muon mask:")
+        print(json.dumps(muon_mask_tree, indent=2, sort_keys=False))
+        optimizer_configuration["muon_weight_dimension_numbers"] = muon_mask_tree
+
     grad_processing.append(optimizer(**optimizer_configuration))
 
     # weight decay
-    weight_decay = training_parameters.get("weight_decay", 0.0)
+    weight_decay = training_config.weight_decay
     assert weight_decay >= 0.0, "Weight decay must be positive"
-    decay_targets = training_parameters.get("decay_targets", [""])
+    decay_targets = training_config.decay_targets
 
     def decay_status(full_path, v):
         full_path = "/".join(full_path).lower()
@@ -349,7 +372,7 @@ def get_optimizer(
             optax.add_decayed_weights(weight_decay=-weight_decay, mask=decay_mask)
         )
 
-    regularize_init_weight = training_parameters.get("regularize_init_weights", 0.0)
+    regularize_init_weight = training_config.regularize_init_weights
     if regularize_init_weight > 0.0:
         print(
             "Regularizing toward initial weights with L2 norm:", regularize_init_weight
@@ -371,7 +394,7 @@ def get_optimizer(
     ilr = -1
 
     # gradient clipping
-    clip_threshold = training_parameters.get("adaptive_gradient_clipping", -1.0)
+    clip_threshold = training_config.adaptive_gradient_clipping
     if clip_threshold > 0.0:
         print("Adaptive gradient clipping threshold:", clip_threshold)
         grad_processing.append(optax.adaptive_grad_clip(clip_threshold))
@@ -385,22 +408,27 @@ def get_optimizer(
     return optax.multi_transform(partition_optimizer, params_partition), ilr
 
 
-def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
-    lr = training_parameters.get("lr", 1.0e-3)
-    init_lr = training_parameters.get("init_lr", lr / 25)
-    final_lr = training_parameters.get("final_lr", lr / 10000)
+def get_lr_schedule(
+        training_config: TrainingConfig
+) -> tuple[Callable, dict[str, Any], Any, bool]:
+    max_epochs = training_config.max_epochs
+    nbatch_per_epoch = training_config.nbatch_per_epoch
+    lr = training_config.lr
+    init_lr = training_config.init_lr
+    final_lr = training_config.final_lr
 
     #### LEARNING RATE SCHEDULER ####
-    schedule_type = training_parameters.get("schedule_type", "cosine_onecycle").lower()
-    schedule_type = training_parameters.get("scheduler", schedule_type).lower()
-    schedule_metrics = training_parameters.get("schedule_metrics", "rmse_tot")
+    schedule_type = (
+        training_config.scheduler or training_config.schedule_type
+    ).lower()
+    schedule_metrics = training_config.schedule_metrics
 
     adaptive_scheduler = False
     print("Schedule type:", schedule_type)
     if schedule_type == "cosine_onecycle":
-        transition_epochs = training_parameters.get("onecycle_epochs", max_epochs)
-        peak_epoch = training_parameters.get("peak_epoch", 0.3 * transition_epochs)
-        linear_warmup = training_parameters.get("linear_warmup", False)
+        transition_epochs = training_config.onecycle_epochs or max_epochs
+        peak_epoch = training_config.peak_epoch or 0.3 * transition_epochs
+        linear_warmup = training_config.linear_warmup
 
         if linear_warmup:
             schedule_ = optax.warmup_cosine_decay_schedule(
@@ -429,7 +457,7 @@ def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
             return lr, new_state
 
     elif schedule_type == "piecewise_interpolate":
-        schedule_params = training_parameters.get("scheduler_parameters", {})
+        schedule_params = training_config.scheduler_parameters
         schedule_ = optax.piecewise_interpolate_schedule(
             **{"init_value": lr, "interpolate_type": "linear", **schedule_params}
         )
@@ -455,9 +483,9 @@ def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
 
     elif schedule_type == "cosine":
         assert (
-            "peak_epoch" in training_parameters
+            training_config.peak_epoch is not None
         ), "Sine schedule requires 'peak_epoch' parameter"
-        period = training_parameters["peak_epoch"] * nbatch_per_epoch
+        period = training_config.peak_epoch * nbatch_per_epoch
         peak_lr = lr
         sch_state = {"count": 0}
 
@@ -472,9 +500,9 @@ def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
             return lr, new_state
 
     elif schedule_type == "reduce_on_plateau":
-        patience = training_parameters.get("patience", 10)
-        factor = training_parameters.get("lr_factor", 0.5)
-        patience_thr = training_parameters.get("patience_thr", 0.0)
+        patience = training_config.patience
+        factor = training_config.lr_factor
+        patience_thr = training_config.patience_thr
         sch_state = {"count": 0, "best": np.inf, "lr": lr, "patience": patience}
         adaptive_scheduler = True
 
@@ -490,7 +518,7 @@ def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
             else:
                 new_state["patience"] += 1
                 if new_state["patience"] >= patience:
-                    new_state["lr"] = state["lr"] * factor
+                    new_state["lr"] = max(state["lr"] * factor, final_lr)
                     new_state["patience"] = 0
                     print("Reducing learning rate to", new_state["lr"])
             return new_state["lr"], new_state
@@ -498,23 +526,27 @@ def get_lr_schedule(max_epochs, nbatch_per_epoch, training_parameters):
     else:
         raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
-    stochastic_scheduler = training_parameters.get("stochastic_scheduler", False)
+    stochastic_scheduler = training_config.stochastic_scheduler
     if stochastic_scheduler:
-        schedule_ = schedule
-        rng_key, scheduler_key = jax.random.split(rng_key)
+        base_schedule = schedule
+        scheduler_key = jax.random.PRNGKey(training_config.scheduler_seed)
         sch_state["rng_key"] = scheduler_key
         sch_state["lr_max"] = lr
         sch_state["lr_min"] = final_lr
 
         def schedule(state, rmse=None):
             new_state = {**state, "lr": state["lr_max"]}
+            lr_max, new_state = base_schedule(new_state, rmse=rmse)
+            lr_max = jnp.maximum(lr_max, new_state["lr_min"])
+            new_state["lr_max"] = lr_max
             if rmse is None:
-                lr_max, new_state = schedule_(new_state, rmse=rmse)
                 lr_min = new_state["lr_min"]
                 new_state["rng_key"], subkey = jax.random.split(new_state["rng_key"])
                 lr = lr_min + (lr_max - lr_min) * jax.random.uniform(subkey)
                 new_state["lr"] = lr
-                new_state["lr_max"] = lr_max
+            else:
+                lr = lr_max
+                new_state["lr"] = lr
 
             return new_state["lr"], new_state
 

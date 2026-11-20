@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, io
+import sys, io
 import argparse
 from pathlib import Path
 
@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from fennol.models import FENNIX
 from fennol.utils import parse_cell, cell_vectors_to_lengths_angles
 from fennol.utils.io import last_xyz_frame, write_xyz_frame, write_arc_frame
+from fennol.utils.device import configure_device, resolve_device
 from fennol.utils.periodic_table import PERIODIC_TABLE_REV_IDX
 from fennol.utils.atomic_units import au
 from fennol.md.utils import optimize_fire2
@@ -54,6 +55,12 @@ def main():
         help="Initial time step for the optimization (default: 0.002)",
     )
     parser.add_argument(
+        "-q","--total_charge",
+        type=int,
+        default=0,
+        help="Total charge of the system (default: 0).",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=10000,
@@ -79,28 +86,8 @@ def main():
     args = parser.parse_args()
 
     # set the device
-    if args.device:
-        device = args.device.lower()
-    elif "FENNOL_DEVICE" in os.environ:
-        device = os.environ["FENNOL_DEVICE"].lower()
-        print(f"# Setting device from env FENNOL_DEVICE={device}")
-    else:
-        device = "cpu"
-        print("# No device specified, using CPU as default")
-
-    if device == "cpu":
-        jax.config.update("jax_platforms", "cpu")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    elif device.startswith("cuda") or device.startswith("gpu"):
-        if ":" in device:
-            num = device.split(":")[-1]
-            os.environ["CUDA_VISIBLE_DEVICES"] = num
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        device = "gpu"
-
-    _device = jax.devices(device)[0]
-    jax.config.update("jax_default_device", _device)
+    device = resolve_device(cli=args.device)
+    configure_device(device)
 
     # set the precision
     if args.f64:
@@ -130,10 +117,14 @@ def main():
     coordinates = np.array(coordinates, dtype=fprec)
     species = np.array([PERIODIC_TABLE_REV_IDX[s] for s in symbols], dtype=np.int32)
     nat = len(species)
+    total_charge = args.total_charge
+    if total_charge != 0:
+        print(f"Using total charge of {total_charge} for the system.")
     inputs = {
         "species": species,
         "natoms": np.array([nat], dtype=np.int32),
         "batch_index": np.array([0] * nat, dtype=np.int32),
+        "total_charge": np.array([total_charge], dtype=np.int32),
     }
 
     ## get cell vectors

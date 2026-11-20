@@ -1,0 +1,48 @@
+# Independent anisotropic harmonic wells (kcal/mol/A**2), one per Ar atom on
+# an 8x8x8 lattice 10 A apart; oscillation periods are 0.5-1 ps.
+temperature_kelvin: 300.0
+stiffness: [1.0, 2.0, 4.0]
+spacing: 10.0
+per_side: 8
+dt_fs: 5.0
+friction_thz: 5.0
+output_interval_steps: 50
+burn_in_steps: 2000
+production_steps: 20000
+# Relative tolerance on <k q**2>/kBT per axis and on the kinetic temperature;
+# statistical errors are about 0.3%.
+tolerance: 0.02
+
+sampling:
+  LGV: {thermostat: LGV}
+  # omega*dt = 0.39 on the stiffest axis: configurational sampling must stay
+  # unbiased for a harmonic system.
+  LGV_dt60: {thermostat: LGV, dt_fs: 60.0}
+  FFLGV: {thermostat: FFLGV}
+
+# Global thermostats on a 32-atom force-shifted LJ argon liquid at the NPT
+# reference volume of validation/barostat: energy and pressure must match the
+# Langevin run within maximum_z_score combined standard errors, and the mean
+# kinetic energy must equal ndof/2 kBT with ndof = 3N for Langevin and 3N-3
+# for momentum-conserving thermostats (a wrong count is a 3.2% error here).
+lj_nvt:
+  epsilon_kcal_per_mol: 0.238
+  sigma_angstrom: 3.4
+  cutoff_sigma: 3.0
+  pressure_unit: atm
+  natoms: 32
+  density_reduced: 0.7286
+  temperature_kelvin: 120.0
+  dt_fs: 5.0
+  thermostat_friction_thz: 5.0
+  output_interval_steps: 20
+  burn_in_steps: 10000
+  production_steps: 100000
+  thermostats: [LGV, BUSSI, NOSE]
+  maximum_z_score: 4.0
+  temperature_tolerance: 0.015
+  kinetic_tolerance: 0.015
+
+restart:
+  steps: 400
+  thermostats: [LGV, FFLGV, BUSSI, NOSE]

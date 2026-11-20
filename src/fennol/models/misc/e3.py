@@ -39,7 +39,9 @@ class FullTensorProduct(nn.Module):
         psout = []
         i12 = []
 
-        lmax_out = self.lmax_out or self.lmax1 + self.lmax2
+        lmax_out = (
+            self.lmax1 + self.lmax2 if self.lmax_out is None else self.lmax_out
+        )
 
         for i1, (l1, p1) in enumerate(irreps_1):
             for i2, (l2, p2) in enumerate(irreps_2):

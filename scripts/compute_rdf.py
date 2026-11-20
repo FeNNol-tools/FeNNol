@@ -40,13 +40,14 @@ def get_pairs(species: Union[List[str], np.ndarray], sp1=None, sp2=None):
         species = np.array(species, dtype=str)
     if sp1 is None:
         if sp2 is None:
-            return np.array(np.triu_indices(len(species), 1)), 0.5 * len(species) ** 2
+            nat = len(species)
+            return np.array(np.triu_indices(nat, 1)), 0.5 * nat * (nat - 1)
         sp1 = sp2
     id1 = np.flatnonzero(species == sp1)
     num1 = len(id1)
     if sp2 == sp1 or sp2 is None:
         pairsloc = np.triu_indices(len(id1), 1)
-        return np.array([id1[pairsloc[0]], id1[pairsloc[1]]]), 0.5 * num1**2
+        return np.array([id1[pairsloc[0]], id1[pairsloc[1]]]), 0.5 * num1 * (num1 - 1)
     id2 = np.flatnonzero(species == sp2)
     num2 = len(id2)
     return np.array([np.repeat(id1, len(id2)), np.tile(id2, len(id1))]), num1 * num2
@@ -131,7 +132,7 @@ def radial_from_file(
             print(cell)
         # setup_figures(["g(r)"])
         # plt.pause(1.)
-        pairs = [p.strip().replace("-", " ").replace("_", " ") for p in pairs]
+        pairs = [p.strip().replace("_", " ") for p in pairs]
         header = " ".join(["r"] + ["-".join(p.split()) for p in pairs])
         box = None
         gr_i = np.zeros((n_bins, len(pairs)))

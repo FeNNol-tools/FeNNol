@@ -17,6 +17,10 @@ class HIPNNEmbedding(nn.Module):
     Adapted from N. Lubbers, J. S. Smith and K. Barros, Hierarchical modeling of molecular energies using a deep neural network
     J. Chem. Phys. 148, 241715 (2018) (J. Chem. Phys. 148, 241715 (2018)) (https://doi.org/10.1063/1.5011181)
 
+    Checkpoint compatibility: the angular coefficients are stored as one
+    value per angular order. HIPNN checkpoints from before this fix fail to
+    load and must be retrained.
+
     """
     
     _graphs_properties: Dict
@@ -136,18 +140,17 @@ class HIPNNEmbedding(nn.Module):
                     zint = jax.lax.index_in_dim(Mi, 0, axis=-1, keepdims=False)
                     Mi = Mi[:, :, 1:]
 
-                ts = self.param(
-                    f"ts_{layer}",
+                tl = self.param(
+                    f"tl_{layer}",
                     lambda key, shape: jax.random.normal(key, shape, dtype=zint.dtype),
-                    (self.lmax, 3),
-                )  # .repeat(reps_l)
+                    (self.lmax,),
+                )
 
-                # zint = zint + jnp.sum(ts[None,None,:]*Mi**2,axis=-1)
                 for l in range(1, self.lmax + 1):
                     Ml = jax.lax.dynamic_slice_in_dim(
                         Mi, start_index=l**2 - 1, slice_size=2 * l + 1, axis=-1
                     )
-                    zint = zint + ts[l, 2] * tssr3(
+                    zint = zint + tl[l - 1] * tssr3(
                         nn.Dense(self.dim, name=f"linear_{layer}_l{l}")(
                             jnp.sum(Ml**2, axis=-1)
                         )

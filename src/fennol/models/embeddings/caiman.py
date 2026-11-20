@@ -122,7 +122,7 @@ class CaimanEmbedding(nn.Module):
 
         for layer in range(self.nlayers):
             if self.message_passing:
-                Zs, Zs = jnp.split(
+                Zs, Zd = jnp.split(
                     nn.Dense(
                         2 * nchannels_density,
                         use_bias=True,

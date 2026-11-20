@@ -112,7 +112,7 @@ class PAINNEmbedding(nn.Module):
             # update
             u,v = jnp.split(
                 nn.Dense(
-                    2 * self.nchannels,
+                    2 * nchannels,
                     use_bias=False,
                     name=f"UV_{layer}",
                 )(v_message),

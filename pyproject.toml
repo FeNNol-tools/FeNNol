@@ -4,7 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
 version_file = "src/fennol/version.py"
+# Untagged builds are `<last tag>.post1.devN`, never a guess at the next release.
+version_scheme = "no-guess-dev"
 local_scheme = "no-local-version"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
 
 [project]
 name = "FeNNol"
@@ -12,8 +17,8 @@ name = "FeNNol"
 dynamic = ["version"]
 description = "FeNNol: Force-field-enhanced Neural Network optimized library"
 readme = "README.md"
-license-files = ["LICENSE"]
 authors = [{ name = "Thomas Plé", email = "thomas.ple@sorbonne-universite.fr" }]
+requires-python = ">=3.12"
 keywords = ["machine learning potential", "jax", "force field","molecular dynamics"]
 classifiers = [
     "Programming Language :: Python",
@@ -22,23 +27,49 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-   "jax",
-   "numpy",
-   "numba",
-   "h5py",
-   "scipy",
-   "sympy",
-   "flax[all]",
-   "tomlkit",
-   "optax",
-   "ase",
-   "pytest",
+    "jax>=0.4.26",
+    "numpy>=2.0.0",
+    "numba>=0.61.0",
+    "h5py>=3.11.0",
+    "scipy>=1.14.0",
+    "sympy>=1.14.0",
+    "flax[all]>=0.8.3",
+    "optax",    
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml",
+    "msgpack",
+    "chex",
+    "pyarrow==21.0.0",
+    "tomlkit>=0.12.5",
+    "ase>=3.25.0",
 ]
 
 [project.optional-dependencies]
 cuda = ["jax[cuda12]"]
 e3nn = ["e3nn-jax"]
 deephp = ["cffi", "pydlpack", "pycuda"]
+train = [
+    "torch>=2,<3",
+]
+mlflow = [
+    "mlflow>=3.3,<4",
+    "psutil", # cpu system metrics
+    "nvidia-ml-py", # gpu system metrics
+    "boto3" # artifacts upload
+]
+
+[dependency-groups]
+# Enable the train extra by default without duplicating its dependencies.
+training = ["FeNNol[train]"]
+dev = [
+    "pytest",
+    "pytest-mock",
+]
+docs = [
+    "pdoc",
+    "FeNNol[e3nn,mlflow]", # pdoc imports every module, including e3nn and mlflow ones
+]
 
 [project.urls]
 Homepage = "https://github.com/FeNNol-tools/FeNNol"
@@ -48,3 +79,14 @@ fennol_md = "fennol.md.dynamic:main"
 fennol_train = "fennol.training.training:main"
 fennol_inspect = "fennol.models.inspect:main"
 fennol_analyze = "fennol.analyze:main"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "train" }]
+
+[tool.uv]
+default-groups = ["dev", "training"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

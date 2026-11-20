@@ -27,6 +27,10 @@ class FENNIXCalculator(ase.calculators.calculator.Calculator):
         Whether to print nblist update information or not.
     energy_terms: list of str, default=None
         The energy terms to include in the total energy. If None, this will default to the energy terms defined in the model.
+
+    The calculator runs on the default JAX device, and JAX opens every visible GPU by default.
+    To use a single device, call `fennol.configure_device` (e.g. with "cpu" or "cuda:0")
+    before any JAX computation, including the creation of the calculator.
     """
 
     implemented_properties = ["energy", "forces", "stress"]
@@ -139,7 +143,10 @@ class FENNIXCalculator(ase.calculators.calculator.Calculator):
                 inputs["reciprocal_cells"] = reciprocal_cell.reshape(1, 3, 3)
             self._raw_inputs = convert_to_jax(inputs)
         else:
-            if "cell" in system_changes:
+            if "cell" in system_changes or "pbc" in system_changes:
+                # Rebuild from the raw inputs so keys removed when PBC is
+                # disabled cannot survive in the cached GPU-preprocessed data.
+                force_cpu_preprocessing = True
                 pbc = np.asarray(atoms.get_pbc(), dtype=bool)
                 if np.all(pbc):
                     use_pbc = True

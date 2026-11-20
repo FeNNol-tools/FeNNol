@@ -87,9 +87,9 @@ class RaSTER(nn.Module):
     """The key in the input dictionary that corresponds to the block index for the MoE network. If None, a normal neural network is used."""
     lode_channels: int = 1
     """The number of channels for the long-range features."""
-    switch_cov_start: float = 0.5
+    switch_cov_start: float = 0.2
     """The start of close-range covalent switch (in units of covalent radii)."""
-    switch_cov_end: float = 0.6
+    switch_cov_end: float = 0.4
     """The end of close-range covalent switch (in units of covalent radii)."""
     normalize_keys: bool = False
     """Whether to normalize queries and keys in the attention mechanism."""

@@ -7,6 +7,39 @@ import numpy as np
 from typing import Union, Callable
 
 
+@partial(jax.jit, static_argnums=(2,3))
+def softabs(x, beta=1.0, symmetric=True, eps=1e-10):
+    f = (jnp.sqrt((x * beta) ** 2 + 1.0) -1.) / (beta + eps)
+    if not symmetric:
+        f = f * (x > 0)
+    return f
+
+@partial(jax.jit, static_argnums=(3,4))
+def softsat(x, alpha=0.0, beta=1.0,symmetric=False,eps=1e-10):
+
+    u = softabs(x,beta,eps=eps,symmetric=True)
+    a = jax.nn.sigmoid(5*alpha)
+    f = a*u + (1-a)*jnp.tanh(u)
+    if not symmetric:
+        f = f * (x > 0)
+    return f
+
+class TrainableSoftSat(nn.Module):
+    alpha: float = 0.0
+    beta: float = 1.0
+    symmetric: bool = False
+    eps: float = 1e-10
+
+    @nn.compact
+    def __call__(self, x):
+        shape = x.shape
+        dim = shape[-1]
+        alpha = self.param("alpha", lambda k, s: jnp.full(s, self.alpha), (1, dim))
+        beta=jnp.abs(self.param("beta", lambda k, s: jnp.full(s, self.beta), (1, dim)))
+        x = x.reshape(-1, dim)
+        return softsat(x, alpha=alpha, beta=beta, symmetric=self.symmetric, eps=self.eps).reshape(shape)
+
+
 class TrainableSiLU(nn.Module):
     @nn.compact
     def __call__(self, x):
@@ -16,6 +49,7 @@ class TrainableSiLU(nn.Module):
         x = x.reshape(-1, shape[-1])
         return (a * x * jax.nn.sigmoid(b * x)).reshape(shape)
 
+
 class DyT(nn.Module):
     alpha0: float = 0.5
 
@@ -23,30 +57,34 @@ class DyT(nn.Module):
     def __call__(self, x):
         shape = x.shape
         dim = shape[-1]
-        a = self.param("scale", lambda k, s: jnp.ones(s,dtype=x.dtype), (1, dim))
-        b = self.param("bias", lambda k, s: jnp.zeros(s,dtype=x.dtype), (1, dim))
-        alpha = self.param("alpha", lambda k: jnp.asarray(self.alpha0,dtype=x.dtype))
+        a = self.param("scale", lambda k, s: jnp.ones(s, dtype=x.dtype), (1, dim))
+        b = self.param("bias", lambda k, s: jnp.zeros(s, dtype=x.dtype), (1, dim))
+        alpha = self.param("alpha", lambda k: jnp.asarray(self.alpha0, dtype=x.dtype))
         x = x.reshape(-1, dim)
-        return (a*jnp.tanh(alpha*x) + b).reshape(shape)
+        return (a * jnp.tanh(alpha * x) + b).reshape(shape)
+
 
 class DynAct(nn.Module):
-    activation : Union[str, Callable]
-    alpha0: float = 1.
+    activation: Union[str, Callable]
+    alpha0: float = 1.0
     channelwise: bool = False
 
     @nn.compact
     def __call__(self, x):
         shape = x.shape
         dim = shape[-1]
-        a = self.param("scale", lambda k, s: jnp.ones(s,dtype=x.dtype), (1, dim))
-        b = self.param("bias", lambda k, s: jnp.zeros(s,dtype=x.dtype), (1, dim))
+        a = self.param("scale", lambda k, s: jnp.ones(s, dtype=x.dtype), (1, dim))
+        b = self.param("bias", lambda k, s: jnp.zeros(s, dtype=x.dtype), (1, dim))
 
-        shape_alpha = (1,dim) if self.channelwise else (1,1)
-        alpha = self.param("alpha", lambda k,s: self.alpha0*jnp.ones(s,dtype=x.dtype), shape_alpha)
+        shape_alpha = (1, dim) if self.channelwise else (1, 1)
+        alpha = self.param(
+            "alpha", lambda k, s: self.alpha0 * jnp.ones(s, dtype=x.dtype), shape_alpha
+        )
 
         x = x.reshape(-1, dim)
         act = activation_from_str(self.activation)
-        return (a*act(alpha*x) + b).reshape(shape)
+        return (a * act(alpha * x) + b).reshape(shape)
+
 
 class TrainableCELU(nn.Module):
     alpha: float = 0.1
@@ -143,9 +181,9 @@ class GausianBasisActivation(nn.Module):
         shape = [1] * (x.ndim - 1) + [nfeatures]
         b = self.param("b", jax.nn.initializers.zeros, shape)
         w0 = self.param("w0", jax.nn.initializers.ones, shape)
-        out = jax.nn.swish(w0*x)
+        out = jax.nn.swish(w0 * x)
 
-        shape+= [self.nbasis]
+        shape += [self.nbasis]
         x0 = self.param(
             "x0",
             lambda key: jnp.asarray(
@@ -156,22 +194,22 @@ class GausianBasisActivation(nn.Module):
             ),
         )
 
-        sigma0 = np.abs(self.xmax - self.xmin)/self.nbasis
-        alphas = (0.5**0.5)*self.param(
+        sigma0 = np.abs(self.xmax - self.xmin) / self.nbasis
+        alphas = (0.5**0.5) * self.param(
             "sigmas",
-            lambda key: jnp.full(shape, 1./sigma0, dtype=x.dtype),
+            lambda key: jnp.full(shape, 1.0 / sigma0, dtype=x.dtype),
         )
 
-        w = self.param(
-            "w", jax.nn.initializers.normal(stddev=0.1), shape
-        )
+        w = self.param("w", jax.nn.initializers.normal(stddev=0.1), shape)
 
-        ex = jnp.exp(-((x[...,None] - x0) * alphas)**2)
+        ex = jnp.exp(-(((x[..., None] - x0) * alphas) ** 2))
 
         return out + (ex * w).sum(axis=-1) + b
 
-def safe_sqrt(x,eps=1.e-5):
+
+def safe_sqrt(x, eps=1.0e-5):
     return jnp.sqrt(jnp.clip(x, min=eps))
+
 
 @jax.jit
 def aptx(x):
@@ -293,6 +331,35 @@ def normalize_activation(
         return rho
 
 
+EVAL_ENV = {
+    "__builtins__": None,
+    **jax.nn.__dict__,
+    **jax.numpy.__dict__,
+    **jax.__dict__,
+    "chain": chain,
+    "pow": pow,
+    "partial": partial,
+    "leaky_celu": leaky_celu,
+    "aptx": aptx,
+    "tssr": tssr,
+    "tssr2": tssr2,
+    "tssr3": tssr3,
+    "ssp": ssp,
+    "smooth_floor": smooth_floor,
+    "smooth_round": smooth_round,
+    "TrainableSiLU": TrainableSiLU,
+    "TrainableCELU": TrainableCELU,
+    "FourierActivation": FourierActivation,
+    "GaussianBasis": GausianBasisActivation,
+    "normalize": normalize_activation,
+    "DyT": DyT,
+    "DynAct": DynAct,
+    "TrainableSoftSat": TrainableSoftSat,
+    "softsat": softsat,
+    "softabs": softabs,
+}
+
+
 def activation_from_str(activation: Union[str, Callable, None]) -> Callable:
     if activation is None:
         return lambda x: x
@@ -305,30 +372,7 @@ def activation_from_str(activation: Union[str, Callable, None]) -> Callable:
     try:
         return eval(
             activation,
-            {"__builtins__": None},
-            {
-                **jax.nn.__dict__,
-                **jax.numpy.__dict__,
-                **jax.__dict__,
-                "chain": chain,
-                "pow": pow,
-                "partial": partial,
-                "leaky_celu": leaky_celu,
-                "aptx": aptx,
-                "tssr": tssr,
-                "tssr2": tssr2,
-                "tssr3": tssr3,
-                "ssp": ssp,
-                "smooth_floor": smooth_floor,
-                "smooth_round": smooth_round,
-                "TrainableSiLU": TrainableSiLU,
-                "TrainableCELU": TrainableCELU,
-                "FourierActivation": FourierActivation,
-                "GaussianBasis": GausianBasisActivation,
-                "normalize": normalize_activation,
-                "DyT": DyT,
-                "DynAct": DynAct,
-            },
+            EVAL_ENV,
         )
     except Exception as e:
         raise ValueError(
