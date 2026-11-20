@@ -32,10 +32,13 @@ with warnings.catch_warnings(record=True) as caught:
     except RuntimeError as exc:
         print(json.dumps({"error": str(exc)}))
         sys.exit()
+def name(d):
+    # platform:id, stable across JAX versions (str() changed in JAX 0.12)
+    return None if d is None else f"{d.platform}:{d.id}"
 print(json.dumps({
     "warnings": [str(w.message) for w in caught],
-    "device": str(dev),
-    "default_device": str(jax.config.jax_default_device),
+    "device": name(dev),
+    "default_device": name(jax.config.jax_default_device),
     "platforms": jax.config.jax_platforms,
     "cuda_visible": xla_bridge.CUDA_VISIBLE_DEVICES.value,
     "env": os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -73,7 +76,7 @@ def test_normalize_device_rejects_invalid_devices(device):
 def test_cpu_disables_cuda_backend_and_keeps_scheduler_gpus():
     result = _run("plain", "cpu")
     assert result["platforms"] == "cpu"
-    assert result["device"] == result["default_device"] == "TFRT_CPU_0"
+    assert result["device"] == result["default_device"] == "cpu:0"
     assert result["env"] == "2,3"
 
 
@@ -88,7 +91,7 @@ def test_gpu_restricts_jax_to_one_visible_gpu(device, index):
 def test_configure_after_backend_initialization_warns_and_selects():
     result = _run("initialized", "cpu")
     assert any("already initialized" in w for w in result["warnings"])
-    assert result["device"] == result["default_device"] == "TFRT_CPU_0"
+    assert result["device"] == result["default_device"] == "cpu:0"
 
 
 
