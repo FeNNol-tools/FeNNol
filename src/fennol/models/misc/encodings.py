@@ -233,7 +233,7 @@ class SpeciesEncoding(nn.Module):
             nstates = len(states_set)
             state_dict = {s: i for i, s in enumerate(states_set)}
             conv_tensor = np.zeros((zmaxpad, nstates))
-            for i, states in enumerate(OXIDATION_STATES[1 : zmax + 1]):
+            for i, states in enumerate(OXIDATION_STATES[1 : zmax + 1], start=1):
                 for s in states:
                     conv_tensor[i, state_dict[s]] = 1
             conv_tensors.append(conv_tensor)
@@ -646,7 +646,9 @@ class RadialBasis(nn.Module):
             ), self.dim]
             activation = self.extra_params.get("activation", default="swish")
             use_bias = self.extra_params.get("use_bias", default=True)
-
+            scale_by_cutoff = self.extra_params.get("scale_by_cutoff", default=False)
+            if scale_by_cutoff:
+                x = x / self.end
             out = FullyConnectedNet(
                 neurons, activation=activation, use_bias=use_bias, squeeze=False
             )(x[:, None])

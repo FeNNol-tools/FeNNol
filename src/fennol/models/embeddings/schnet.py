@@ -10,7 +10,7 @@ from typing import Callable, Dict, Sequence, Union, ClassVar
 import flax.linen as nn
 import jax
 
-from ...utils.activations import ssp
+from ...utils.activations import activation_from_str
 from ..misc.encodings import RadialBasis, SpeciesEncoding
 from ..misc.nets import FullyConnectedNet
 
@@ -71,6 +71,7 @@ class SchNetEmbedding(nn.Module):
     @nn.compact
     def __call__(self, inputs):
         """Forward pass."""
+        activation = activation_from_str(self.activation)
         species = inputs["species"]
         graph = inputs[self.graph_key]
         switch = graph["switch"][:, None]
@@ -112,14 +113,14 @@ class SchNetEmbedding(nn.Module):
             )(radial_basis)
             xi_j = xi[edge_dst]
             xi = jax.ops.segment_sum(
-                self.activation(w_l) * xi_j * switch, edge_src, species.shape[0]
+                activation(w_l) * xi_j * switch, edge_src, species.shape[0]
             )
 
             # Atom-wise
             xi = atom_wise(xi, 2, layer)
 
             # Activation
-            xi = self.activation(xi)
+            xi = activation(xi)
 
             # Atom-wise
             xi = atom_wise(xi, 3, layer)

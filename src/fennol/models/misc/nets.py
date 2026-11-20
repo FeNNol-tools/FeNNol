@@ -280,8 +280,12 @@ class HierarchicalNet(nn.Module):
             split_rngs={"params": True},
             in_axes=-2,
             out_axes=-2,
-            kenel_init=self.kernel_init,
-        )(self.neurons, self.activation, self.use_bias)
+        )(
+            self.neurons,
+            self.activation,
+            self.use_bias,
+            kernel_init=self.kernel_init,
+        )
 
         out = networks(x)
         # scale each layer by a decay factor
@@ -701,8 +705,8 @@ class GatedPerceptron(nn.Module):
             nn.Dense(self.dim, use_bias=self.use_bias, kernel_init=kernel_init)(x)
         )
 
-        if self.squeeze and out.shape[-1] == 1:
-            out = jnp.squeeze(out, axis=-1)
+        if self.squeeze and x.shape[-1] == 1:
+            x = jnp.squeeze(x, axis=-1)
         ############################
 
         if self.input_key is not None:
@@ -863,7 +867,8 @@ class ZLoRANet(nn.Module):
             )(x)
             A = self.param(
                 f"A_{i+1}",
-                lambda key, shape: jnp.zeros(shape, dtype=x.dtype),
+                lambda key, shape: jax.random.normal(key, shape, dtype=x.dtype)
+                / jnp.sqrt(shape[-1]),
                 (self.zmax + 2, self.ranks[i], x.shape[-1]),
             )[species]
             B = self.param(
@@ -882,7 +887,8 @@ class ZLoRANet(nn.Module):
         )(x)
         A = self.param(
             f"A_{len(self.neurons)}",
-            lambda key, shape: jnp.zeros(shape, dtype=x.dtype),
+            lambda key, shape: jax.random.normal(key, shape, dtype=x.dtype)
+            / jnp.sqrt(shape[-1]),
             (self.zmax + 2, self.ranks[-1], x.shape[-1]),
         )[species]
         B = self.param(
@@ -937,6 +943,8 @@ class BlockIndexNet(nn.Module):
     """Whether to remove the last axis of the output tensor if it is of dimension 1."""
     kernel_init: Union[str, Callable] = "lecun_normal()"
     """The kernel initialization method for the fully connected networks."""
+    is_preprocess: bool = False
+    """Whether to use the preprocess mode."""
     # check_unhandled: bool = True
 
     FID: ClassVar[str] = "BLOCK_INDEX_NET"
@@ -988,6 +996,10 @@ class BlockIndexNet(nn.Module):
     def __call__(
         self, inputs: Union[dict, Tuple[jax.Array, jax.Array]]
     ) -> Union[dict, jax.Array]:
+        
+        output_key = self.name if self.output_key is None else self.output_key
+        if output_key in inputs and self.is_preprocess:
+            return inputs
 
         if self.input_key is None:
             assert not isinstance(
@@ -1051,6 +1063,5 @@ class BlockIndexNet(nn.Module):
         ############################
 
         if self.input_key is not None:
-            output_key = self.name if self.output_key is None else self.output_key
-            return {**inputs, output_key: out} if output_key is not None else out
+            return {**inputs, output_key: out}
         return out

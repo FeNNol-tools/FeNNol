@@ -1,0 +1,146 @@
+# Quick barostat checks on force-shifted Lennard-Jones argon
+# (cutoff 3 sigma, no tail correction, explicit periodic images). Tolerances
+# are loose: the goal is to catch wrong ensembles, not to certify convergence.
+epsilon_kcal_per_mol: 0.238
+sigma_angstrom: 3.4
+cutoff_sigma: 3.0
+pressure_unit: atm
+
+liquid:
+  natoms: 32
+  start_density_reduced: 0.70
+  temperature_kelvin: 120.0
+  pressure_reduced: 0.8
+  dt_fs: 5.0
+  thermostat_friction_thz: 5.0
+  output_interval_steps: 20
+  burn_in_steps: 20000
+  production_steps: 200000
+  # Independent NPT Monte Carlo reference (npt_mc.py, regenerate with
+  # --only reference): three chains of 10,000 burn-in and 65,000 production
+  # sweeps; standard errors from the spread of the chain means.
+  reference:
+    volume_mean_reduced: 43.920
+    volume_mean_se: 0.108
+    volume_variance_reduced: 6.526
+    volume_variance_se: 0.307
+    energy_mean_epsilon: -137.873
+    energy_mean_se: 0.319
+  mc:
+    seeds: [83611, 83612, 83613]
+    burn_in_sweeps: 10000
+    production_sweeps: 65000
+    max_displacement_sigma: 0.12
+    max_log_volume_step: 0.025
+  barostats:
+    crescale: {barostat: C-RESCALE, tau_piston_ps: 1.0, compressibility_atm: 5.0e-4}
+    langevin: {barostat: LGV, tau_piston_ps: 1.0, gamma_piston_thz: 10.0}
+  volume_mean_tolerance: 0.015
+  volume_variance_tolerance: 0.25
+  # Mean Langevin piston temperature relative to T (statistical error ~2%).
+  piston_temperature_tolerance: 0.1
+  # Berendsen does not sample NPT; it must relax an expanded box to the
+  # reference volume.
+  berendsen: {barostat: BERENDSEN, tau_piston_ps: 1.0, compressibility_atm: 5.0e-4,
+              start_density_reduced: 0.60, steps: 40000, volume_tolerance: 0.03}
+
+crystal:
+  # 3x3x3 conventional FCC cells.
+  natoms: 108
+  density_reduced: 1.0
+  temperature_kelvin: 59.8
+  pressure_reduced: 3.0
+  dt_fs: 5.0
+  thermostat_friction_thz: 5.0
+  output_interval_steps: 20
+  burn_in_steps: 10000
+  production_steps: 100000
+  double_precision: true
+  barostats:
+    crescale: {barostat: C-RESCALE, tau_piston_ps: 1.0, compressibility_atm: 5.0e-5}
+    langevin: {barostat: LGV, tau_piston_ps: 1.0, gamma_piston_thz: 10.0}
+  cases:
+    flexible_crescale: {barostat: crescale}
+    flexible_langevin: {barostat: langevin}
+    isotropic_crescale: {barostat: crescale, isotropic: true}
+    orthorhombic_crescale: {barostat: crescale, mask: [true, true, true, false, false, false]}
+  # The mean cell metric must stay cubic (equal diagonal, zero shear) relative
+  # to its diagonal; this catches shear or tensor-virial errors shared by both
+  # barostats. C-rescale and Langevin must agree on the mean cell metric and
+  # on its fluctuations; the isotropic run on the mean volume.
+  symmetry_tolerance: 0.01
+  piston_temperature_tolerance: 0.1
+  metric_mean_tolerance: 0.005
+  metric_covariance_tolerance: 0.35
+  volume_tolerance: 0.005
+  berendsen: {barostat: BERENDSEN, tau_piston_ps: 1.0, compressibility_atm: 5.0e-5,
+              strain: [[1.03, 0.0, 0.0], [0.03, 0.98, 0.0], [0.0, 0.02, 1.0]],
+              steps: 40000, metric_tolerance: 0.01}
+
+# Ideal gas: 8 non-interacting Ar atoms. The exact volume distribution is
+# Gamma(N_f/3 + 1, kBT/P), N_f = 3N with Langevin and 3N-3 with momentum-
+# conserving thermostats. A wrong power of V or degree-of-freedom term shifts
+# the mean by ~1/(N+1) = 11%. The *_dt20 cases repeat at a 4x timestep.
+ideal_gas:
+  natoms: 8
+  temperature_kelvin: 300.0
+  pressure_atm: 400.0
+  dt_fs: 5.0
+  thermostat_friction_thz: 5.0
+  output_interval_steps: 10
+  burn_in_steps: 20000
+  production_steps: 200000
+  barostats:
+    # Ideal-gas compressibility is 1/P.
+    crescale: {barostat: C-RESCALE, tau_piston_ps: 0.5, compressibility_atm: 2.5e-3}
+    langevin: {barostat: LGV, tau_piston_ps: 0.5, gamma_piston_thz: 10.0}
+  cases:
+    crescale: {barostat: crescale}
+    langevin: {barostat: langevin}
+    crescale_bussi: {barostat: crescale, thermostat: BUSSI}
+    langevin_bussi: {barostat: langevin, thermostat: BUSSI}
+    crescale_dt20: {barostat: crescale, dt_fs: 20.0}
+    langevin_dt20: {barostat: langevin, dt_fs: 20.0}
+  mean_tolerance: 0.03
+  variance_tolerance: 0.15
+
+# Ideal gas in a cell held by E(h) = k/2 sum_ij (G_ij - L0**2 delta_ij)**2,
+# G = h h^T. The exact distribution of the six lower-triangular cell entries,
+# uniform in the entries, comes from a vectorized Metropolis sample. The spring
+# alone gives about 10% fluctuations of the diagonal and 14% of the shear
+# entries; P is close to N kBT / L0**3, so the cell stays near cubic.
+cell_spring:
+  natoms: 8
+  temperature_kelvin: 300.0
+  pressure_atm: 300.0
+  stiffness_kcal_per_mol_a4: 1.5e-3
+  length_angstrom: 10.0
+  dt_fs: 5.0
+  thermostat_friction_thz: 5.0
+  output_interval_steps: 10
+  burn_in_steps: 20000
+  production_steps: 200000
+  barostats:
+    # The spring gives an effective modulus of about 4000 atm per axis; the
+    # short C-rescale tau gives about 750 effective samples per entry.
+    crescale: {barostat: C-RESCALE, tau_piston_ps: 0.2, compressibility_atm: 2.5e-4}
+    langevin: {barostat: LGV, tau_piston_ps: 0.5, gamma_piston_thz: 10.0}
+  cases:
+    orthorhombic_crescale: {barostat: crescale, mask: [1, 1, 1, 0, 0, 0]}
+    orthorhombic_langevin: {barostat: langevin, mask: [1, 1, 1, 0, 0, 0]}
+    flexible_crescale: {barostat: crescale}
+    flexible_langevin: {barostat: langevin}
+  reference: {chains: 4000, sweeps: 6000, burn_in: 1000}
+  # Mean of each entry within max(tolerance * L0, 3 SE). A measure weighted by
+  # h_xx**2 h_yy instead of uniform shifts the diagonal means by about 2%.
+  mean_tolerance: 0.005
+  variance_tolerance: 0.15
+
+restart:
+  steps: 400
+  cases:
+    crescale: {system: liquid, barostat: crescale}
+    langevin: {system: liquid, barostat: langevin}
+    berendsen: {system: liquid, barostat: berendsen}
+    crystal_crescale: {system: crystal, barostat: crescale}
+    crystal_langevin: {system: crystal, barostat: langevin}

@@ -5,7 +5,7 @@ on:
     branches:
       - main
     tags:
-      - '*' 
+      - 'v*'  # release tags vYYYY.MM[.N]; any other tag must not publish
 
 jobs:
   build:
@@ -19,7 +19,11 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.x"
+        python-version: "3.12"
+    - name: Install project and test dependencies
+      run: python -m pip install -e ".[train]" pytest pytest-mock
+    - name: Run test suite
+      run: python -m pytest
     - name: Install pypa/build
       run: >-
         python3 -m
@@ -28,6 +32,19 @@ jobs:
         --user
     - name: Build a binary wheel and a source tarball
       run: python3 -m build
+    - name: Verify installed wheel and CLI entry points
+      run: |
+        python -m pip install --force-reinstall --no-deps dist/*.whl
+        cd "${RUNNER_TEMP}"
+        fennol_md --help
+        fennol_train --help
+        fennol_analyze --help
+    - name: Verify installed source distribution
+      run: |
+        python -m pip install --force-reinstall --no-deps dist/*.tar.gz
+        cd "${RUNNER_TEMP}"
+        fennol_md --help
+        fennol_train --help
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:
@@ -42,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/FeNNol  # Replace <package-name> with your PyPI project name
+      url: https://pypi.org/p/FeNNol
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
     steps:

@@ -58,13 +58,14 @@ class InputFile(dict):
     case_insensitive = True
 
     def __init__(self, *args, **kwargs):
-        super(InputFile, self).__init__(*args, **kwargs)
-        if InputFile.case_insensitive:
-            for key in list(self.keys()):
-                dict.__setitem__(self, key.lower(), dict.get(self, key))
-        for key in list(self.keys()):
-            if isinstance(self[key], dict):
-                dict.__setitem__(self, key, InputFile(**self[key]))
+        d = dict(*args, **kwargs)
+        d2 = {}
+        for key in list(d.keys()):
+            # assert isinstance(key, str), f"Error: keys must be strings, got key of type {type(key)}"
+            _key = str(key).lower() if InputFile.case_insensitive else str(key)
+            d2[_key] = InputFile(d[key]) if isinstance(d[key], dict) else d[key]
+
+        super(InputFile, self).__init__(**d2)
         
 
     def get(self, path, default=None):
@@ -204,7 +205,7 @@ def parse_input(input_file,us:UnitSystem=au):
             path.append(cat_fields[1:])
             continue
         if cat_fields.endswith("{}"):
-            struct.store("/".join("path") + "/" + cat_fields[1:-2], InputFile())
+            struct.store("/".join(path + [cat_fields[:-2]]), InputFile())
             continue
 
         # print(current_category)
@@ -310,7 +311,10 @@ def convert_dict_units(d: Dict[str, Any],us:UnitSystem=au) -> Dict[str, Any]:
         if isinstance(v, dict):
             d2[k] = convert_dict_units(v,us)
             continue
-        key, unit = _get_unit_from_key(k,us)
+        if isinstance(k, str):
+            key, unit = _get_unit_from_key(k,us)
+        else:
+            key, unit = k, None
         if unit is None:
             d2[k] = v
             continue

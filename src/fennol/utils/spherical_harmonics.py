@@ -122,7 +122,8 @@ def generate_spherical_harmonics(
         polynomials = [sympy.simplify(p, full=True) for p in polynomials]
 
     u = ",\n        ".join(
-        ", ".join(f"sh_{j}_{m}" for m in range(2 * j + 1)) for j in range(l + 1)
+        ", ".join(f"sh_{j}_{m}" for m in range(2 * j + 1))
+        for j in range(lmax + 1)
     )
     if vmapped:
         fn_str += f"  return jnp.array([\n        {u}\n    ])\n"

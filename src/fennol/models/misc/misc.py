@@ -259,13 +259,14 @@ class SumAxis(nn.Module):
     """The key of the output array. If None, the input key is used."""
     norm: Optional[str] = None
     """Normalization of the sum. Can be 'dim', 'sqrt', or 'none'."""
+    keepdims: bool = False
 
     FID: ClassVar[str] = "SUM_AXIS"
 
     @nn.compact
     def __call__(self, inputs) -> Any:
         x = inputs[self.key]
-        output = jnp.sum(x, axis=self.axis)
+        output = jnp.sum(x, axis=self.axis, keepdims=self.keepdims)
         if self.norm is not None:
             norm = self.norm.lower()
             if norm == "dim":
@@ -384,6 +385,46 @@ class Activation(nn.Module):
         return {**inputs, output_key: output}
 
 
+class ApplyFunction(nn.Module):
+    """Apply a use-defined function to array(s).
+
+    FID: APPLY_FUNCTION
+    """
+
+    function_str: str
+    """The function string. This is a lambda-style function x,y: x**2 + 2*y. The arguments must be specified in `argument_keys` in the same order."""
+    argument_keys: Union[str, Sequence[str]]
+    output_key: Optional[str] = None
+    """The key of the output array. If None, the input key is used."""
+
+    FID: ClassVar[str] = "APPLY_FUNCTION"
+
+    @nn.compact
+    def __call__(self, inputs) -> Any:
+        from ...utils.activations import EVAL_ENV
+
+        assert (
+            ":" in self.function_str
+        ), "function_str must be a lambda function string, e.g. 'x,y: x**2 +2*y'"
+        keys = (
+            self.argument_keys
+            if isinstance(self.argument_keys, Sequence)
+            and not isinstance(self.argument_keys, str)
+            else [self.argument_keys]
+        )
+        arguments = [inputs[k] for k in keys]
+        fn_args = [arg.strip() for arg in self.function_str.split(":")[0].split(",")]
+        assert len(fn_args) == len(arguments), f"Number of arguments in function_str {len(fn_args)} does not match number of argument_keys {len(arguments)}"
+
+        func = eval("lambda "+self.function_str, EVAL_ENV)
+        try:
+            output = func(*arguments)
+        except Exception as e:
+            raise ValueError(f"Error evaluating function_str {self.function_str} with arguments {self.argument_keys}: {e}")
+        output_key = self.output_key if self.output_key is not None else self.name
+        return {**inputs, output_key: output}
+
+
 class LayerNorm(nn.Module):
     """Layer normalization module.
 
@@ -396,12 +437,16 @@ class LayerNorm(nn.Module):
     """The key of the output. If None, it is the same as the key."""
     axis: Union[int, Sequence[int]] = -1
     """The axis to normalize."""
-    epsilon: float = 1e-6
+    kind: str = "rmsnorm"
+    """The kind of normalization. Can be 'layernorm', 'rmsnorm' or 'none'."""
+    eps: float = 1e-6
     """The epsilon for numerical stability."""
-    scale: float = 1.0
-    """The scale for the normalization."""
-    shift: float = 0.0
-    """The shift for the normalization."""
+    elementwise_affine: bool = True
+    """Whether to apply an element-wise affine transformation after normalization."""
+    use_bias: Optional[bool] = None
+    """use_bias is None by default to follow the defaults form pytorch LayerNorm (bias by default) and RMSNorm (no bias)."""
+    alpha_init: float = 0.5
+    beta_init: float = 0.0
 
     FID: ClassVar[str] = "LAYER_NORM"
 
@@ -413,18 +458,63 @@ class LayerNorm(nn.Module):
             x = inputs[self.key]
         else:
             x = inputs
-        mu = jnp.mean(x, axis=self.axis, keepdims=True)
-        dx = x - mu
-        var = jnp.mean(dx**2, axis=self.axis, keepdims=True)
-        sig = (self.epsilon + var) ** (-0.5)
-        out = self.scale * (sig * dx) + self.shift
 
-        output_key = self.output_key if self.output_key is not None else self.key
+        kind = self.kind.lower()
+        assert kind in [
+            "rmsnorm",
+            "layernorm",
+            "none",
+            "dyt",
+            "derf",
+        ], f"Unknown normalization type {self.kind}"
+
+        use_bias_default = kind in ["layernorm", "dyt", "derf"]
+        use_bias = self.use_bias if self.use_bias is not None else use_bias_default
+
+        if kind == "layernorm":
+            mean = jnp.mean(x, axis=self.axis, keepdims=True)
+            x = x - mean
+
+        if kind in ["rmsnorm", "layernorm"]:
+            var = jnp.mean(x**2, axis=self.axis, keepdims=True)
+            sig = (self.eps + var) ** (-0.5)
+            x = x * sig
+        
+        if kind in ["dyt", "derf"]:
+            alpha = self.param("alpha", lambda rng: jnp.asarray(self.alpha_init))
+            beta = self.param("beta", lambda rng: jnp.asarray(self.beta_init))
+            x = alpha*x + beta
+            if kind == "dyt":
+                x = jnp.tanh(x)
+            else:
+                x = jax.scipy.special.erf(x)
+
+        if self.elementwise_affine and kind != "none":
+            assert isinstance(
+                self.axis, int
+            ), "LAYER_NORM: elementwise_affine is only implemented for single axis normalization"
+            axisdim = x.shape[self.axis]
+            weight = self.param("weight", nn.initializers.ones, (axisdim,))
+            # shape = [1] * (len(x.shape) - 1) + [x.shape[-1]]
+            shape = [1] * len(x.shape)
+            shape[self.axis] = axisdim
+            x = x * weight.reshape(shape)
+
+        if use_bias and kind != "none":
+            assert isinstance(
+                self.axis, int
+            ), "LAYER_NORM: use_bias is only implemented for single axis normalization"
+            axisdim = x.shape[self.axis]
+            bias = self.param("bias", nn.initializers.zeros, (axisdim,))
+            shape = [1] * len(x.shape)
+            shape[self.axis] = axisdim
+            x = x + bias.reshape(shape)
 
         if isinstance(inputs, dict):
-            return {**inputs, output_key: out}
+            output_key = self.output_key if self.output_key is not None else self.key
+            return {**inputs, output_key: x}
 
-        return out
+        return x
 
 
 class Scale(nn.Module):
@@ -681,13 +771,17 @@ class SwitchFunction(nn.Module):
         if switch_type == "cosine":
             p = self.p if self.p is not None else 1.0
             if self.trainable:
-                p = self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                p = jnp.abs(
+                    self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                )
             switch = (0.5 * jnp.cos(x * (jnp.pi / end)) + 0.5) ** p
 
         elif switch_type == "polynomial":
             p = self.p if self.p is not None else 3.0
             if self.trainable:
-                p = self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                p = jnp.abs(
+                    self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                )
             d = x / end
             switch = (
                 1.0
@@ -699,7 +793,9 @@ class SwitchFunction(nn.Module):
         elif switch_type == "exponential":
             p = self.p if self.p is not None else 1.0
             if self.trainable:
-                p = self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                p = jnp.abs(
+                    self.param("p", lambda rng: jnp.asarray(p, dtype=jnp.float32))
+                )
             r2 = x**2
             c2 = end**2
             switch = jnp.exp(-p * r2 / (c2 - r2))

@@ -1,6 +1,7 @@
 import time
 import math
 import os
+from pathlib import Path
 
 import numpy as np
 import jax
@@ -9,36 +10,97 @@ import jax.numpy as jnp
 from .thermostats import get_thermostat
 from .barostats import get_barostat
 from .colvars import setup_colvars
+from .lambdadyn import initialize_lambdadyn
+from .opes import initialize_opes
+from .eabf import initialize_eabf
 from .spectra import initialize_ir_spectrum
 
-from .utils import load_dynamics_restart, get_restart_file,optimize_fire2, us
-from .initial import load_model, load_system_data, initialize_preprocessing
+from .utils import load_dynamics_restart, get_restart_file, optimize_fire2, us
+from .initial import load_model, load_simulation_setup, initialize_preprocessing
+from ..utils import detect_topology, find_molecules
+
+
+def _validate_replica_colvars(nreplicas, colvars_definitions, nbeads=None):
+    if nreplicas > 1 and nbeads is None and colvars_definitions is not None:
+        raise ValueError(
+            "Collective variables are not supported with independent replicas"
+        )
+
+
+def _validate_replica_lambdadyn(nreplicas, lambdadyn_params, nbeads=None):
+    if nreplicas > 1 and nbeads is None and lambdadyn_params is not None:
+        raise ValueError("lambdadyn is not supported with independent replicas")
 
 
 def initialize_dynamics(simulation_parameters, fprec, rng_key):
+    """Build the Simulation and its initial state.
+
+    Returns ``(step, update_batch, simulation_setup, step_state, batch, dynamics_state)``:
+
+    - ``simulation_setup``: fixed for the whole Simulation, whether read from the
+      input or derived here (time step, thermostat name, variable cell, ...).
+    - ``dynamics_state``: the Dynamics state passed through jitted functions
+      (coordinates, velocities, forces, thermostat and barostat state, ...).
+    - ``step_state``: mutable state that ``step`` updates outside ``jit``: step
+      counter, preprocessing state, neighbor-list countdown, IR spectrum state, and
+      the thermostat post-step state, whose large arrays would add overhead to
+      jitted calls.
+    - ``batch``: the Model input for the current coordinates.
+
+    ``step(istep, step_state, dynamics_state, batch)`` advances the Simulation by
+    one step and returns ``(step_state, dynamics_state, batch, model_output)``.
+    """
     ### LOAD MODEL
     model = load_model(simulation_parameters)
     model_energy_unit = us.get_multiplier(model.energy_unit)
 
     ### Get the coordinates and species from the xyz file
-    system_data, conformation = load_system_data(simulation_parameters, fprec)
-    system_data["model_energy_unit"] = model_energy_unit
-    system_data["model_energy_unit_str"] = model.energy_unit
+    simulation_setup, batch = load_simulation_setup(simulation_parameters, fprec)
+    simulation_setup["model_energy_unit"] = model_energy_unit
+    simulation_setup["model_energy_unit_str"] = model.energy_unit
 
-    ### FINISH BUILDING conformation
-    do_restart = os.path.exists(get_restart_file(system_data))
+    ### FINISH BUILDING batch
+    do_restart = os.path.exists(get_restart_file(simulation_setup))
     if do_restart:
         ### RESTART FROM PREVIOUS DYNAMICS
-        restart_data = load_dynamics_restart(system_data)
+        restart_data = load_dynamics_restart(simulation_setup)
         print("# RESTARTING FROM PREVIOUS DYNAMICS")
         model.preproc_state = restart_data["preproc_state"]
-        conformation["coordinates"] = restart_data["coordinates"]
+        batch["coordinates"] = restart_data["coordinates"]
+        if "cells" in restart_data:
+            batch["cells"] = jnp.asarray(restart_data["cells"], dtype=fprec)
+            batch["reciprocal_cells"] = jnp.linalg.inv(
+                batch["cells"]
+            )
     else:
         restart_data = {}
 
+    ## GET FROZEN ATOMS
+    nat = simulation_setup["nat"]
+    nreplicas = simulation_setup["nreplicas"]
+    frozen_atoms = simulation_setup["frozen_atoms"]
+    if frozen_atoms is not None:
+        freeze_mask = np.ones((nat, 1), dtype=bool)
+        freeze_mask[frozen_atoms] = False
+        freeze_mask_replicas = np.tile(freeze_mask, (nreplicas, 1))
+
+    fix_com = simulation_parameters.get("fix_com", False)
+    """@keyword[fennol_md] fix_com
+    Recenter the coordinates on the centre of mass at start and after every
+    step. Only positions are shifted: velocities, and hence the thermostat and
+    the degree-of-freedom count, are unchanged (see remove_com). Valid only
+    for translationally invariant forces.
+    Default: False
+    """
+    if fix_com and frozen_atoms is not None:
+        # Recentering would move the frozen atoms with the rest of the system.
+        raise ValueError("fix_com is not compatible with frozen atoms")
+    if fix_com and simulation_setup.get("thermal_com", False):
+        print("# Warning: fix_com recenters positions while the centre-of-mass velocity is kept (remove_com: false)")
+
     ### INITIALIZE PREPROCESSING
-    preproc_state, conformation = initialize_preprocessing(
-        simulation_parameters, model, conformation, system_data
+    preproc_state, batch = initialize_preprocessing(
+        simulation_parameters, model, batch, simulation_setup
     )
 
     minimize = simulation_parameters.get("xyz_input/minimize", False)
@@ -47,26 +109,34 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
     Default: False
     """
     if minimize and not do_restart:
-        assert system_data["nreplicas"] == 1, "Minimization is only supported for single replica systems"
+        # assert (
+        #     simulation_setup["nreplicas"] == 1
+        # ), "Minimization is only supported for single replica systems"
         model.preproc_state = preproc_state
         convert = us.KCALPERMOL / model_energy_unit
-        nat = system_data["nat"]
+
         def energy_force_fn(coordinates):
-            inputs = {**conformation, "coordinates": coordinates}
-            e, f, _ = model.energy_and_forces(
-                **inputs, gpu_preprocessing=True
-            )
-            e = float(e[0]) * convert / nat
+            inputs = {**batch, "coordinates": coordinates}
+            e, f, _ = model.energy_and_forces(**inputs, gpu_preprocessing=True)
+            e = np.mean(np.array(e)) * convert / nat
             f = np.array(f) * convert
+            if frozen_atoms is not None:
+                f = (f.reshape(-1,nat,3) * freeze_mask[None,:,:]).reshape(-1,3)
             return e, f
-        tol = simulation_parameters.get("xyz_input/minimize_ftol", 1e-1/us.KCALPERMOL)*us.KCALPERMOL
+
+        tol = (
+            simulation_parameters.get("xyz_input/minimize_ftol", 1e-1 / us.KCALPERMOL)
+            * us.KCALPERMOL
+        )
         """@keyword[fennol_md] xyz_input/minimize_ftol
         Force tolerance for minimization.
         Default: 0.1 kcal/mol/Å
         """
-        print(f"# Minimizing initial configuration with RMS force tolerance = {tol:.1e} kcal/mol/A")
-        conformation["coordinates"], success = optimize_fire2(
-            conformation["coordinates"],
+        print(
+            f"# Minimizing initial configuration with RMS force tolerance = {tol:.1e} kcal/mol/A"
+        )
+        batch["coordinates"], success = optimize_fire2(
+            batch["coordinates"],
             energy_force_fn,
             atol=tol,
             max_disp=0.02,
@@ -77,12 +147,36 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
             print("# Warning: Minimization failed, continuing with last configuration")
         # write the minimized coordinates as an xyz file
         from ..utils.io import write_xyz_frame
-        with open(system_data["name"]+".opt.xyz", "w") as f:
-            write_xyz_frame(f, system_data["symbols"],np.array(conformation["coordinates"]),cell=conformation.get("cells", None))
-        print("# Minimized configuration written to", system_data["name"]+".opt.xyz")
+
+        with open(simulation_setup["name"] + ".opt.xyz", "w") as f:
+            write_xyz_frame(
+                f,
+                simulation_setup["symbols"],
+                np.array(batch["coordinates"]).reshape(-1, nat, 3)[0],
+                cell=batch.get("cells", [None])[0],
+            )
+        print("# Minimized configuration written to", simulation_setup["name"] + ".opt.xyz")
         preproc_state = model.preproc_state
-        conformation = model.preprocessing.process(preproc_state, conformation)
-        system_data["initial_coordinates"] = np.array(conformation["coordinates"]).copy()
+        batch = model.preprocessing.process(preproc_state, batch)
+        simulation_setup["optimized_coordinates"] = np.array(
+            batch["coordinates"]
+        ).copy()
+
+        ### update topology if needed
+        topology_key = simulation_parameters.get("topology", None)
+        if topology_key is not None and str(topology_key).lower() == "detect":
+            cell = (
+                simulation_setup["pbc"]["cell"] if simulation_setup["pbc"] is not None else None
+            )
+            topology = detect_topology(
+                simulation_setup["species"], simulation_setup["optimized_coordinates"], cell=cell
+            )
+            topo_file = simulation_setup["name"] + ".topo"
+            np.savetxt(topo_file, topology + 1, fmt="%d")
+            print("# Updated detected topology after geometry optimization.")
+            molecule_indices = find_molecules(nat, topology[:, 0], topology[:, 1])
+            simulation_setup["topology"] = topology
+            simulation_setup["molecule_indices"] = molecule_indices
 
     ### get dynamics parameters
     dt = simulation_parameters.get("dt")
@@ -91,40 +185,43 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
     Type: float, Required
     """
     dt2 = 0.5 * dt
-    mass = system_data["mass"]
-    densmass = system_data["totmass_Da"] * (us.MOL/us.CM**3)
-    nat = system_data["nat"]
+    mass = simulation_setup["mass"]
+    densmass = simulation_setup["totmass_Da"] * (us.MOL / us.CM**3)
     dtm = jnp.asarray(dt / mass[:, None], dtype=fprec)
-    ek_avg = 0.5 * nat * system_data["kT"] * np.eye(3)
+    ek_avg = 0.5 * nat * simulation_setup["kT"] * np.eye(3)
 
-    nreplicas = system_data.get("nreplicas", 1)
-    nbeads = system_data.get("nbeads", None)
+    nbeads = simulation_setup.get("nbeads", None)
     if nbeads is not None:
-        nreplicas = nbeads
         dtm = dtm[None, :, :]
     
-    fix_com = simulation_parameters.get("fix_com", False)
     if fix_com:
-        massprop = system_data["mass_Da"]/system_data["totmass_Da"]
+        massprop = simulation_setup["mass_Da"]/simulation_setup["totmass_Da"]
         print("# Reference frame fixed to center of mass")
-        x = conformation["coordinates"].reshape(-1, nat, 3)
+        x = batch["coordinates"].reshape(-1, nat, 3)
         if nbeads is None:
             xcom = jnp.sum(x*massprop[None,:,None], axis=1, keepdims=True)
         else:
             xcom = jnp.sum(x*massprop[None,:,None], axis=(0,1), keepdims=True)/nbeads
-        conformation["coordinates"] = (x - xcom).reshape(-1, 3)
+        batch["coordinates"] = (x - xcom).reshape(-1, 3)
 
     ### INITIALIZE DYNAMICS STATE
-    system = {"coordinates": conformation["coordinates"]}
-    dyn_state = {
-        "istep": 0,
-        "dt": dt,
-        "pimd": nbeads is not None,
-        "preproc_state": preproc_state,
-        "start_time_ps": restart_data.get("simulation_time_ps", 0.),
-    }
-    gradient_keys = ["coordinates"]
-    thermo_updates = []
+    dynamics_state = {"coordinates": batch["coordinates"], "istep": restart_data.get("integration_step", 0)}
+    simulation_setup["dt"] = dt
+    simulation_setup["pimd"] = nbeads is not None
+    simulation_setup["start_time_ps"] = restart_data.get("simulation_time_ps", 0.0)
+    step_state = {"istep": 0, "preproc_state": preproc_state}
+    forces_key = simulation_parameters.get("forces_key", None)
+    """@keyword[fennol_md] forces_key
+    Key for forces calculation. If not specified, forces are computed from gradient of total energy.
+    """
+    if forces_key is not None:
+        gradient_keys = []
+        print("# Using custom forces_key:", forces_key)
+    else:
+        gradient_keys = ["coordinates"]
+    middle_updates = []
+    outer_updates = []
+    bias_terms = {}
 
     ### INITIALIZE THERMOSTAT
     thermostat_rng, rng_key = jax.random.split(rng_key)
@@ -133,17 +230,17 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         thermostat_post,
         thermostat_state,
         initial_vel,
-        dyn_state["thermostat_name"],
+        simulation_setup["thermostat_name"],
         ekin_instant,
-    ) = get_thermostat(simulation_parameters, dt, system_data, fprec, thermostat_rng,restart_data)
+    ) = get_thermostat(simulation_parameters, dt, simulation_setup, fprec, thermostat_rng,restart_data)
     do_thermostat_post = thermostat_post is not None
     if do_thermostat_post:
         thermostat_post, post_state = thermostat_post
-        dyn_state["thermostat_post_state"] = post_state
+        step_state["thermostat_post_state"] = post_state
 
     assert ekin_instant in ["B", "O"], "ekin_instant must be 'B' or 'O'"
 
-    system["thermostat"] = thermostat_state
+    dynamics_state["thermostat"] = thermostat_state
 
     if "initial_velocities" in simulation_parameters:
         initial_vel_file = simulation_parameters["initial_velocities"]
@@ -159,41 +256,44 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         if nbeads is None:
             initial_vel = initial_vel.reshape(-1, 3)
 
-    system["vel"] = restart_data.get("vel", initial_vel).astype(fprec)
+    dynamics_state["vel"] = restart_data.get("vel", initial_vel).astype(fprec)
 
     ### PBC
-    pbc_data = system_data.get("pbc", None)
+    pbc_data = simulation_setup.get("pbc", None)
     if pbc_data is not None:
         ### INITIALIZE BAROSTAT
         barostat_key, rng_key = jax.random.split(rng_key)
-        thermo_update_ensemble, variable_cell, barostat_state = get_barostat(
-            thermostat, simulation_parameters, dt, system_data, fprec, barostat_key,restart_data
+        thermo_update_ensemble, variable_cell, barostat_state, pressure_instant = (
+            get_barostat(
+                thermostat,
+                simulation_parameters,
+                dt,
+                simulation_setup,
+                fprec,
+                barostat_key,
+                restart_data,
+            )
         )
         estimate_pressure = variable_cell or pbc_data["estimate_pressure"]
-        system["barostat"] = barostat_state
-        system["cell"] = conformation["cells"][0]
+        dynamics_state["barostat"] = barostat_state
+        dynamics_state["cell"] = batch["cells"][0]
         if estimate_pressure:
-            pressure_o_weight = simulation_parameters.get("pressure_o_weight", 1.0)
-            """@keyword[fennol_md] pressure_o_weight
-            Weight factor for mixing middle (O) and outer time step kinetic energies in pressure estimator.
-            Default: 1.0
-            """
-            assert (
-                0.0 <= pressure_o_weight <= 1.0
-            ), "pressure_o_weight must be between 0 and 1"
+            if forces_key is not None:
+                raise ValueError("Pressure not available with custom forces_key")
             gradient_keys.append("strain")
+
         print("# Estimate pressure: ", estimate_pressure)
     else:
         estimate_pressure = False
         variable_cell = False
 
-        def thermo_update_ensemble(x, v, system):
-            v, thermostat_state = thermostat(v, system["thermostat"])
-            return x, v, {**system, "thermostat": thermostat_state}
+        def thermo_update_ensemble(x, v, dynamics_state):
+            v, thermostat_state = thermostat(v, dynamics_state["thermostat"])
+            return x, v, {**dynamics_state, "thermostat": thermostat_state}
 
-    dyn_state["estimate_pressure"] = estimate_pressure
-    dyn_state["variable_cell"] = variable_cell
-    thermo_updates.append(thermo_update_ensemble)
+    simulation_setup["estimate_pressure"] = estimate_pressure
+    simulation_setup["variable_cell"] = variable_cell
+    middle_updates.append(thermo_update_ensemble)
 
     if estimate_pressure:
         use_average_Pkin = simulation_parameters.get("use_average_Pkin", False)
@@ -201,12 +301,11 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         Use time-averaged kinetic energy for pressure estimation instead of instantaneous values.
         Default: False
         """
-        is_qtb = dyn_state["thermostat_name"].endswith("QTB")
+        is_qtb = simulation_setup["thermostat_name"].endswith("QTB")
         if is_qtb and use_average_Pkin:
             raise ValueError(
                 "use_average_Pkin is not compatible with QTB thermostat, please set use_average_Pkin to False"
             )
-
 
     ### ENERGY ENSEMBLE
     ensemble_key = simulation_parameters.get("etot_ensemble_key", None)
@@ -223,8 +322,11 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
     """
     use_colvars = colvars_definitions is not None
     if use_colvars:
+        _validate_replica_colvars(nreplicas, colvars_definitions, nbeads=nbeads)
         colvars_calculators, colvars_names = setup_colvars(colvars_definitions)
-        dyn_state["colvars"] = colvars_names
+        simulation_setup["colvars"] = colvars_names
+    else:
+        colvars_calculators = {}
 
     ### IR SPECTRUM
     do_ir_spectrum = simulation_parameters.get("ir_spectrum", False)
@@ -234,26 +336,141 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
     """
     assert isinstance(do_ir_spectrum, bool), "ir_spectrum must be a boolean"
     if do_ir_spectrum:
-        is_qtb = dyn_state["thermostat_name"].endswith("QTB")
+        is_qtb = simulation_setup["thermostat_name"].endswith("QTB")
         model_ir, ir_state, save_dipole, ir_post = initialize_ir_spectrum(
-            simulation_parameters, system_data, fprec, dt, is_qtb
+            simulation_parameters, simulation_setup, fprec, dt, is_qtb
         )
-        dyn_state["ir_spectrum"] = ir_state
+        step_state["ir_spectrum"] = ir_state
+
+    ### LAMBDADYN
+    lambdadyn_params = simulation_parameters.get("lambdadyn", None)
+    use_lambdadyn = lambdadyn_params is not None
+    if use_lambdadyn:
+        if forces_key is not None:
+            raise ValueError("lambdadyn is not compatible with custom forces_key")
+        assert isinstance(lambdadyn_params, dict), "lambdadyn must be a dictionary"
+        _validate_replica_lambdadyn(
+            nreplicas, lambdadyn_params, nbeads=nbeads
+        )
+        lambdadyn_key, rng_key = jax.random.split(rng_key)
+        lambdadyn_step, lambdadyn_bias, lambdadyn_post, lambdadyn_state = (
+            initialize_lambdadyn(
+                simulation_parameters,
+                dt,
+                simulation_setup,
+                fprec,
+                lambdadyn_key,
+                restart_data,
+            )
+        )
+        outer_updates.append(lambdadyn_step)
+        bias_terms["alch"] = lambdadyn_bias
+        dynamics_state["lambdadyn"] = lambdadyn_state
+        batch["alch_ligand_charge"] = lambdadyn_state["alch_ligand_charge"]
+        batch["alch_group"] = lambdadyn_state["alch_group"]
+        gradient_keys = gradient_keys + ["alch_elambda", "alch_vlambda"]
+
+    ### OPES
+    opes_params = simulation_parameters.get("opes", None)
+    use_opes = opes_params is not None
+    if use_opes:
+        assert use_colvars, "opes requires colvars to be defined"
+        assert isinstance(opes_params, dict), "opes must be a dictionary"
+        opes_key, rng_key = jax.random.split(rng_key)
+        opes_step, opes_bias, opes_post, opes_state = initialize_opes(
+            simulation_parameters,
+            dt,
+            simulation_setup,
+            fprec,
+            opes_key,
+            colvars_calculators,
+            restart_data,
+        )
+        outer_updates.append(opes_step)
+        bias_terms["opes"] = opes_bias
+        dynamics_state["opes"] = opes_state
+    
+    ### ABF
+    abf_params = simulation_parameters.get("abf", None)
+    use_abf = abf_params is not None
+    if use_abf:
+        assert use_colvars, "abf requires colvars to be defined"
+        assert isinstance(abf_params, dict), "abf must be a dictionary"
+        abf_key, rng_key = jax.random.split(rng_key)
+        abf_step, abf_bias, abf_post, abf_state = initialize_eabf(
+            simulation_parameters,
+            dt,
+            simulation_setup,
+            fprec,
+            abf_key,
+            colvars_calculators,
+            restart_data,
+        )
+        outer_updates.append(abf_step)
+        bias_terms["abf"] = abf_bias
+        dynamics_state["abf"] = abf_state
+
+    ### RESTRAINTS
+    restraints_params = simulation_parameters.get("restraints", None)
+    use_restraints = restraints_params is not None
+    if use_restraints:
+        assert isinstance(restraints_params, dict), "restraints must be a dictionary"
+        from .restraints import initialize_restraints
+
+        restraints = initialize_restraints(
+            simulation_parameters, simulation_setup, fprec, colvars_calculators
+        )
+        for k, v in restraints.items():
+            bias_terms[k] = v
 
     ### BUILD GRADIENT FUNCTION
-    energy_and_gradient = model.get_gradient_function(
-        *gradient_keys, jit=True, variables_as_input=True
-    )
+    if gradient_keys == []:
+        def energy_and_gradient(variables, batch):
+            e, out = model._total_energy(variables, batch)
+            de = {}
+            if forces_key is not None:
+                f = out[forces_key]
+                if f.ndim == 3:
+                    f=f.mean(axis=1)
+                batch_index = batch["batch_index"]
+                nbatch = batch["natoms"].shape[0]
+                fsum = jax.ops.segment_sum(f, batch_index, num_segments=nbatch)
+                fsum = fsum / batch["natoms"][:, None]
+                f = f - fsum[batch_index]
+                de["coordinates"] = -f
+                
+            return e, de, out
+    else:
+        if forces_key is not None:
+            raise ValueError("Custom forces_key is not compatible with explicit gradients, please set forces_key to None")
+        energy_and_gradient = model.get_gradient_function(
+            *gradient_keys, jit=True, variables_as_input=True
+        )
 
-    ### COLLECT THERMO UPDATES
-    if len(thermo_updates) == 1:
-        thermo_update = thermo_updates[0]
+    ### COLLECT UPDATES
+    if len(middle_updates) == 1:
+        middle_update = middle_updates[0]
     else:
 
-        def thermo_update(x, v, system):
-            for update in thermo_updates:
-                x, v, system = update(x, v, system)
-            return x, v, system
+        def middle_update(x, v, dynamics_state):
+            for update in middle_updates:
+                x, v, dynamics_state = update(x, v, dynamics_state)
+            return x, v, dynamics_state
+
+    if len(outer_updates) == 1:
+        outer_update = outer_updates[0]
+    else:
+
+        def outer_update(x, v, dynamics_state):
+            for update in outer_updates:
+                x, v, dynamics_state = update(x, v, dynamics_state)
+            return x, v, dynamics_state
+
+    ### cleanup biases
+    bias_terms = {k: v for k, v in bias_terms.items() if v is not None}
+    use_biases = len(bias_terms.keys()) > 0
+    if use_biases:
+        print("# Using bias terms in dynamics")
 
     ### RING POLYMER INITIALIZATION
     if nbeads is not None:
@@ -262,8 +479,8 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         Use Cayley propagator for ring polymer molecular dynamics instead of standard propagation.
         Default: True
         """
-        omk = system_data["omk"]
-        eigmat = system_data["eigmat"]
+        omk = simulation_setup["omk"]
+        eigmat = simulation_setup["eigmat"]
         cayfact = 1.0 / (4.0 + (dt * omk[1:, None, None]) ** 2) ** 0.5
         if cay_correction:
             axx = jnp.asarray(2 * cayfact)
@@ -274,36 +491,56 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
             axv = jnp.asarray(np.sin(omk[1:, None, None] * dt2) / omk[1:, None, None])
             avx = jnp.asarray(-omk[1:, None, None] * np.sin(omk[1:, None, None] * dt2))
 
-        coordinates = conformation["coordinates"].reshape(nbeads, -1, 3)
-        eigx = jnp.zeros_like(coordinates).at[0].set(coordinates[0])
-        system["coordinates"] = eigx
+        # coordinates = batch["coordinates"].reshape(nbeads, -1, 3)
+        # eigx = jnp.zeros_like(coordinates).at[0].set(coordinates[0])
+        eigx = jnp.einsum(
+            "in,i...->n...", eigmat, batch["coordinates"].reshape(nbeads, -1, 3)
+        ) * (1.0 / nbeads**0.5)
+        dynamics_state["coordinates"] = eigx
+
+    ### Key to keep in input for preprocessing
+    input_keys_to_keep = simulation_parameters.get("input_keys_to_keep", None)
+    """@keyword[fennol_md] input_keys_to_keep
+    List of additional keys from simulation_setup to keep in the input batch for preprocessing.
+    Default: None
+    """
 
     ###############################################
     ### DEFINE UPDATE FUNCTION
     @jax.jit
-    def update_conformation(conformation, system):
-        x = system["coordinates"]
+    def update_batch(batch, dynamics_state):
+        x = dynamics_state["coordinates"]
         if nbeads is not None:
             x = jnp.einsum("in,n...->i...", eigmat, x).reshape(nbeads * nat, 3) * (
                 nbeads**0.5
             )
-        conformation = {**conformation, "coordinates": x}
+        batch = {**batch, "coordinates": x}
         if variable_cell:
-            conformation["cells"] = system["cell"][None, :, :].repeat(nreplicas, axis=0)
+            batch["cells"] = dynamics_state["cell"][None, :, :].repeat(nreplicas, axis=0)
+            batch["reciprocal_cells"] = jnp.linalg.inv(dynamics_state["cell"])[
+                None, :, :
+            ].repeat(nreplicas, axis=0)
 
-        
+        if use_lambdadyn:
+            batch["alch_lambda"] = dynamics_state["lambdadyn"]["alch_lambda"]
+            batch["alch_elambda"] = dynamics_state["lambdadyn"]["alch_elambda"]
+            batch["alch_vlambda"] = dynamics_state["lambdadyn"]["alch_vlambda"]
 
-        return conformation
+        return batch
 
     ###############################################
     ### DEFINE INTEGRATION FUNCTIONS
     def integrate_A_half(x0, v0):
         if nbeads is None:
+            if frozen_atoms is not None:
+                v0 = v0 * freeze_mask_replicas
             return x0 + dt2 * v0, v0
 
         # update coordinates and velocities of a free ring polymer for a half time step
-        eigx_c = x0[0] + dt2 * v0[0]
         eigv_c = v0[0]
+        if frozen_atoms is not None:
+            eigv_c = eigv_c * freeze_mask
+        eigx_c = x0[0] + dt2 * eigv_c
         eigx = x0[1:] * axx + v0[1:] * axv
         eigv = x0[1:] * avx + v0[1:] * axx
 
@@ -313,11 +550,11 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         )
 
     @jax.jit
-    def integrate(system):
-        x = system["coordinates"]
-        v = system["vel"] + dtm * system["forces"]
+    def integrate(dynamics_state):
+        x, v, dynamics_state = outer_update(dynamics_state["coordinates"], dynamics_state["vel"], dynamics_state)
+        v = v + dtm * dynamics_state["forces"]
         x, v = integrate_A_half(x, v)
-        x, v, system = thermo_update(x, v, system)
+        x, v, dynamics_state = middle_update(x, v, dynamics_state)
         x, v = integrate_A_half(x, v)
 
         if fix_com:
@@ -329,40 +566,57 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
                 xcom = jnp.sum(x[0]*massprop[:,None], axis=0, keepdims=True)
                 x = x.at[0].set(x[0] - xcom)
 
-        return {**system, "coordinates": x, "vel": v}
+        return {**dynamics_state, "coordinates": x, "vel": v, "istep": dynamics_state["istep"] + 1}
 
     ###############################################
     ### DEFINE OBSERVABLE FUNCTION
     @jax.jit
-    def update_observables(system, conformation):
+    def update_observables(dynamics_state, batch):
         ### POTENTIAL ENERGY AND FORCES
-        epot, de, out = energy_and_gradient(model.variables, conformation)
+        epot, de, out = energy_and_gradient(model.variables, batch)
         out["forces"] = -de["coordinates"]
         epot = epot / model_energy_unit
         de = {k: v / model_energy_unit for k, v in de.items()}
-        forces = -de["coordinates"]
 
+        # Convert model gradients from physical coordinates to normal-mode
+        # coordinates before adding biases. Bias terms consume `dynamics_state`, whose
+        # coordinates are already in normal modes for PIMD.
         if nbeads is not None:
-            ### PROJECT FORCES ONTO POLYMER NORMAL MODES
-            forces = jnp.einsum(
-                "in,i...->n...", eigmat, forces.reshape(nbeads, nat, 3)
+            de["coordinates"] = jnp.einsum(
+                "in,i...->n...", eigmat, de["coordinates"].reshape(nbeads, nat, 3)
             ) * (1.0 / nbeads**0.5)
 
-        
-        system = {
-            **system,
+        # ADD BIASES
+        if use_biases:
+            ebias = {}
+            for bias_name, bias_term in bias_terms.items():
+                eb, deb = bias_term(dynamics_state)
+                ebias[bias_name] = eb
+                for k, v in deb.items():
+                    de[k] = de.get(k, 0.0) + v
+
+        forces = -de["coordinates"]
+
+        dynamics_state = {
+            **dynamics_state,
             "epot": jnp.mean(epot),
             "forces": forces,
             "energy_gradients": de,
         }
+        if use_biases:
+            dynamics_state["ebias"] = ebias
 
         ### KINETIC ENERGY
-        v = system["vel"]
+        v = dynamics_state["vel"]
         if ekin_instant == "B":
             v = v + 0.5 * dtm * forces
+        if nbeads is None and frozen_atoms is not None:
+            # Frozen atoms have no kinetic degrees of freedom, including during
+            # the initial observable evaluation before their first A-step.
+            v = v * freeze_mask_replicas
                     
         if nbeads is None:
-            corr_kin = system["thermostat"].get("corr_kin", 1.0)
+            corr_kin = dynamics_state["thermostat"].get("corr_kin", 1.0)
             # ek = 0.5 * jnp.sum(mass[:, None] * v**2) / state_th.get("corr_kin", 1.0)
             ek = (0.5 / nreplicas / corr_kin) * jnp.sum(
                 mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0
@@ -372,138 +626,143 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
                 mass[:, None, None] * v[0, :, :, None] * v[0, :, None, :], axis=0
             )
             ek = ek_c - 0.5 * jnp.sum(
-                system["coordinates"][1:, :, :, None] * forces[1:, :, None, :],
+                dynamics_state["coordinates"][1:, :, :, None] * forces[1:, :, None, :],
                 axis=(0, 1),
             )
-            system["ek_c"] = jnp.trace(ek_c)
+            dynamics_state["ek_c"] = jnp.trace(ek_c)
 
-        system["ek"] = jnp.trace(ek)
-        system["ek_tensor"] = ek
+        dynamics_state["ek"] = jnp.trace(ek)
+        dynamics_state["ek_tensor"] = ek
 
         if estimate_pressure:
             if use_average_Pkin:
                 ek = ek_avg
-            elif pressure_o_weight != 1.0:
-                v = system["vel"] + 0.5 * dtm * system["forces"]
+            elif pressure_instant != "O":
+                alpha = 0.5 if pressure_instant == "B" else 1.0
+                v = dynamics_state["vel"] + alpha * dtm * dynamics_state["forces"]
                 if nbeads is None:
-                    corr_kin = system["thermostat"].get("corr_kin", 1.0)
+                    corr_kin = dynamics_state["thermostat"].get("corr_kin", 1.0)
                     # ek = 0.5 * jnp.sum(mass[:, None] * v**2) / state_th.get("corr_kin", 1.0)
+                    if frozen_atoms is not None:
+                        v = v * freeze_mask_replicas
                     ek = (0.5 / nreplicas / corr_kin) * jnp.sum(
                         mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0
                     )
                 else:
+                    if frozen_atoms is not None:
+                        v = v.at[0].set(v[0] * freeze_mask)
                     ek_c = 0.5 * jnp.sum(
                         mass[:, None, None] * v[0, :, :, None] * v[0, :, None, :],
                         axis=0,
                     )
                     ek = ek_c - 0.5 * jnp.sum(
-                        system["coordinates"][1:, :, :, None] * forces[1:, :, None, :],
+                        dynamics_state["coordinates"][1:, :, :, None] * forces[1:, :, None, :],
                         axis=(0, 1),
                     )
-                b = pressure_o_weight
-                ek = (1.0 - b) * ek + b * system["ek_tensor"]
 
             vir = jnp.mean(de["strain"], axis=0)
-            system["virial"] = vir
+            dynamics_state["virial"] = vir
             out["virial_tensor"] = vir * model_energy_unit
-            
-            volume = jnp.abs(jnp.linalg.det(system["cell"]))
-            Pres =  ek*(2./volume)  - vir/volume
-            system["pressure_tensor"] = Pres
-            system["pressure"] = jnp.trace(Pres) * (1.0 / 3.0)
+
+            volume = jnp.abs(jnp.linalg.det(dynamics_state["cell"]))
+            Pres = ek * (2.0 / volume) - vir / volume
+            dynamics_state["pressure_tensor"] = Pres
+            dynamics_state["pressure"] = jnp.trace(Pres) * (1.0 / 3.0)
             if variable_cell:
                 density = densmass / volume
-                system["density"] = density
-                system["volume"] = volume
+                dynamics_state["density"] = density
+                dynamics_state["volume"] = volume
 
         if ensemble_key is not None:
-            kT = system_data["kT"]
+            kT = simulation_setup["kT"]
             dE = (
-                jnp.mean(out[ensemble_key], axis=0) / model_energy_unit - system["epot"]
+                jnp.mean(out[ensemble_key], axis=0) / model_energy_unit - dynamics_state["epot"]
             )
-            system["ensemble_weights"] = -dE / kT
+            dynamics_state["ensemble_weights"] = -dE / kT
 
         if "total_dipole" in out:
             if nbeads is None:
-                system["total_dipole"] = out["total_dipole"][0]
+                dynamics_state["total_dipole"] = out["total_dipole"][0]
             else:
-                system["total_dipole"] = jnp.mean(out["total_dipole"], axis=0)
+                dynamics_state["total_dipole"] = jnp.mean(out["total_dipole"], axis=0)
 
         if use_colvars:
-            coords = system["coordinates"].reshape(-1, nat, 3)[0]
+            coords = dynamics_state["coordinates"].reshape(-1, nat, 3)[0]
+            cell = dynamics_state["cell"] if "cell" in dynamics_state else None
+
             colvars = {}
             for colvar_name, colvar_calc in colvars_calculators.items():
-                colvars[colvar_name] = colvar_calc(coords)
-            system["colvars"] = colvars
+                colvars[colvar_name] = colvar_calc(coords,cell)
+            dynamics_state["colvars"] = colvars
 
-        return system, out
+        return dynamics_state, out
 
     ###############################################
     ### IR SPECTRUM
     if do_ir_spectrum:
         # @jax.jit
-        # def update_dipole(ir_state,system,conformation):
+        # def update_dipole(ir_state,dynamics_state,batch):
         #     def mumodel(coords):
-        #         out = model_ir._apply(model_ir.variables,{**conformation,"coordinates":coords})
+        #         out = model_ir._apply(model_ir.variables,{**batch,"coordinates":coords})
         #         if nbeads is None:
         #             return out["total_dipole"][0]
         #         return out["total_dipole"].sum(axis=0)
         #     dmudqmodel = jax.jacobian(mumodel)
 
-        #     dmudq = dmudqmodel(conformation["coordinates"])
+        #     dmudq = dmudqmodel(batch["coordinates"])
         #     # print(dmudq.shape)
         #     if nbeads is None:
-        #         vel = system["vel"].reshape(-1,1,nat,3)[0]
+        #         vel = dynamics_state["vel"].reshape(-1,1,nat,3)[0]
         #         mudot = (vel*dmudq).sum(axis=(1,2))
         #     else:
         #         dmudq = dmudq.reshape(3,nbeads,nat,3)#.mean(axis=1)
-        #         vel = (jnp.einsum("in,n...->i...", eigmat, system["vel"]) *  nbeads**0.5
+        #         vel = (jnp.einsum("in,n...->i...", eigmat, dynamics_state["vel"]) *  nbeads**0.5
         #         )
-        #         # vel = system["vel"][0].reshape(1,nat,3)
+        #         # vel = dynamics_state["vel"][0].reshape(1,nat,3)
         #         mudot = (vel[None,...]*dmudq).sum(axis=(1,2,3))/nbeads
 
         #     ir_state = save_dipole(mudot,ir_state)
         #     return ir_state
         @jax.jit
-        def update_conformation_ir(conformation, system):
-            conformation = {
-                **conformation,
-                "coordinates": system["coordinates"].reshape(-1, nat, 3)[0],
+        def update_batch_ir(batch, dynamics_state):
+            batch = {
+                **batch,
+                "coordinates": dynamics_state["coordinates"].reshape(-1, nat, 3)[0],
                 "natoms": jnp.asarray([nat]),
                 "batch_index": jnp.asarray([0] * nat),
-                "species": jnp.asarray(system_data["species"].reshape(-1, nat)[0]),
+                "species": jnp.asarray(simulation_setup["species"].reshape(-1, nat)[0]),
             }
             if variable_cell:
-                conformation["cells"] = system["cell"][None, :, :]
-                conformation["reciprocal_cells"] = jnp.linalg.inv(system["cell"])[
+                batch["cells"] = dynamics_state["cell"][None, :, :]
+                batch["reciprocal_cells"] = jnp.linalg.inv(dynamics_state["cell"])[
                     None, :, :
                 ]
-            return conformation
+            return batch
 
         @jax.jit
-        def update_dipole(ir_state, system, conformation):
+        def update_dipole(ir_state, dynamics_state, batch):
             if model_ir is not None:
-                out = model_ir._apply(model_ir.variables, conformation)
+                out = model_ir._apply(model_ir.variables, batch)
                 q = out.get("charges", jnp.zeros(nat)).reshape((-1, nat))
                 dip = out.get("dipoles", jnp.zeros((nat, 3))).reshape((-1, nat, 3))
             else:
-                q = system.get("charges", jnp.zeros(nat)).reshape((-1, nat))
-                dip = system.get("dipoles", jnp.zeros((nat, 3))).reshape((-1, nat, 3))
+                q = dynamics_state.get("charges", jnp.zeros(nat)).reshape((-1, nat))
+                dip = dynamics_state.get("dipoles", jnp.zeros((nat, 3))).reshape((-1, nat, 3))
             if nbeads is not None:
                 q = jnp.mean(q, axis=0)
                 dip = jnp.mean(dip, axis=0)
-                vel = system["vel"][0]
-                pos = system["coordinates"][0]
+                vel = dynamics_state["vel"][0]
+                pos = dynamics_state["coordinates"][0]
             else:
                 q = q[0]
                 dip = dip[0]
-                vel = system["vel"].reshape(-1, nat, 3)[0]
-                pos = system["coordinates"].reshape(-1, nat, 3)[0]
+                vel = dynamics_state["vel"].reshape(-1, nat, 3)[0]
+                pos = dynamics_state["coordinates"].reshape(-1, nat, 3)[0]
 
             if pbc_data is not None:
                 cell_reciprocal = (
-                    conformation["cells"][0],
-                    conformation["reciprocal_cells"][0],
+                    batch["cells"][0],
+                    batch["reciprocal_cells"][0],
                 )
             else:
                 cell_reciprocal = None
@@ -541,9 +800,9 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
         if nblist_stride <= 0:
             ## reference skin parameters at 300K (from Tinker-HP)
             ##   => skin of 2 A gives you 40 fs without complete rebuild
-            t_ref = 40.0 /us.FS # FS
+            t_ref = 40.0 / us.FS  # FS
             nblist_skin_ref = 2.0  # A
-            nblist_stride = int(math.floor(nblist_skin / nblist_skin_ref * t_ref / dt))
+            nblist_stride = max(1,int(math.floor(nblist_skin / nblist_skin_ref * t_ref / dt)))
         print(
             f"# nblist_skin: {nblist_skin:.2f} A, nblist_stride: {nblist_stride} steps, nblist_warmup: {nblist_warmup} steps"
         )
@@ -551,110 +810,135 @@ def initialize_dynamics(simulation_parameters, fprec, rng_key):
     if nblist_skin <= 0:
         nblist_stride = 1
 
-    dyn_state["nblist_countdown"] = 0
-    dyn_state["print_skin_activation"] = nblist_warmup > 0
+    step_state["nblist_countdown"] = 0
+    step_state["print_skin_activation"] = nblist_warmup > 0
 
-    def update_graphs(istep, dyn_state, system, conformation, force_preprocess=False):
-        nblist_countdown = dyn_state["nblist_countdown"]
+    def update_graphs(istep, step_state, dynamics_state, batch, force_preprocess=False):
+        nblist_countdown = step_state["nblist_countdown"]
         if nblist_countdown <= 0 or force_preprocess or (istep < nblist_warmup):
             ### FULL NBLIST REBUILD
-            dyn_state["nblist_countdown"] = nblist_stride - 1
-            preproc_state = dyn_state["preproc_state"]
-            conformation = model.preprocessing.process(
-                preproc_state, update_conformation(conformation, system)
+            step_state["nblist_countdown"] = nblist_stride - 1
+            preproc_state = step_state["preproc_state"]
+            batch = model.preprocessing.process(
+                preproc_state, update_batch(batch, dynamics_state)
             )
-            preproc_state, state_up, conformation, overflow = (
-                model.preprocessing.check_reallocate(preproc_state, conformation)
+            preproc_state, state_up, batch, overflow = (
+                model.preprocessing.check_reallocate(preproc_state, batch)
             )
-            dyn_state["preproc_state"] = preproc_state
+            step_state["preproc_state"] = preproc_state
             if nblist_verbose and overflow:
                 print("step", istep, ", nblist overflow => reallocating nblist")
                 print("size updates:", state_up)
 
             if do_ir_spectrum and model_ir is not None:
-                conformation_ir = model_ir.preprocessing.process(
-                    dyn_state["preproc_state_ir"],
-                    update_conformation_ir(dyn_state["conformation_ir"], system),
+                batch_ir = model_ir.preprocessing.process(
+                    step_state["preproc_state_ir"],
+                    update_batch_ir(step_state["batch_ir"], dynamics_state),
                 )
                 (
-                    dyn_state["preproc_state_ir"],
+                    step_state["preproc_state_ir"],
                     _,
-                    dyn_state["conformation_ir"],
+                    step_state["batch_ir"],
                     overflow,
                 ) = model_ir.preprocessing.check_reallocate(
-                    dyn_state["preproc_state_ir"], conformation_ir
+                    step_state["preproc_state_ir"], batch_ir
                 )
 
         else:
             ### SKIN UPDATE
-            if dyn_state["print_skin_activation"]:
+            if step_state["print_skin_activation"]:
                 if nblist_verbose:
                     print(
                         "step",
                         istep,
                         ", end of nblist warmup phase => activating skin updates",
                     )
-                dyn_state["print_skin_activation"] = False
+                step_state["print_skin_activation"] = False
 
-            dyn_state["nblist_countdown"] = nblist_countdown - 1
-            conformation = model.preprocessing.update_skin(
-                update_conformation(conformation, system)
+            step_state["nblist_countdown"] = nblist_countdown - 1
+            batch = model.preprocessing.update_skin(
+                update_batch(batch, dynamics_state)
             )
             if do_ir_spectrum and model_ir is not None:
-                dyn_state["conformation_ir"] = model_ir.preprocessing.update_skin(
-                    update_conformation_ir(dyn_state["conformation_ir"], system)
+                step_state["batch_ir"] = model_ir.preprocessing.update_skin(
+                    update_batch_ir(step_state["batch_ir"], dynamics_state)
                 )
 
-        return conformation, dyn_state
+        return batch, step_state
 
     ################################################
     ### DEFINE STEP FUNCTION
-    def step(istep, dyn_state, system, conformation, force_preprocess=False):
+    def step(istep, step_state, dynamics_state, batch, force_preprocess=False):
 
-        dyn_state = {
-            **dyn_state,
-            "istep": dyn_state["istep"] + 1,
+        step_state = {
+            **step_state,
+            "istep": step_state["istep"] + 1,
         }
 
         ### INTEGRATE EQUATIONS OF MOTION
-        system = integrate(system)
+        dynamics_state = integrate(dynamics_state)
 
         ### UPDATE CONFORMATION AND GRAPHS
-        conformation, dyn_state = update_graphs(
-            istep, dyn_state, system, conformation, force_preprocess
+        batch, step_state = update_graphs(
+            istep, step_state, dynamics_state, batch, force_preprocess
         )
 
         ## COMPUTE FORCES AND OBSERVABLES
-        system, out = update_observables(system, conformation)
+        dynamics_state, out = update_observables(dynamics_state, batch)
 
         ## END OF STEP UPDATES
         if do_thermostat_post:
-            system["thermostat"], dyn_state["thermostat_post_state"] = thermostat_post(
-                system["thermostat"], dyn_state["thermostat_post_state"]
+            dynamics_state["thermostat"], step_state["thermostat_post_state"] = thermostat_post(
+                dynamics_state["thermostat"], step_state["thermostat_post_state"]
             )
-        
+
+        if use_lambdadyn:
+            dynamics_state["lambdadyn"] = lambdadyn_post(dynamics_state["lambdadyn"])
+        if use_opes:
+            dynamics_state["opes"] = opes_post(dynamics_state["opes"])
+        if use_abf:
+            dynamics_state["abf"] = abf_post(dynamics_state["abf"])
+
         if do_ir_spectrum:
             ir_state = update_dipole(
-                dyn_state["ir_spectrum"], system, dyn_state["conformation_ir"]
+                step_state["ir_spectrum"], dynamics_state, step_state["batch_ir"]
             )
-            dyn_state["ir_spectrum"] = ir_post(ir_state)
+            step_state["ir_spectrum"] = ir_post(ir_state)
 
-        return dyn_state, system, conformation, out
+        return step_state, dynamics_state, batch, out
 
     ###########################################################
 
     print("# Computing initial energy and forces")
 
-    conformation = update_conformation(conformation, system)
-    # initialize IR conformation
+    batch = update_batch(batch, dynamics_state)
+    # initialize IR batch
     if do_ir_spectrum and model_ir is not None:
-        dyn_state["preproc_state_ir"], dyn_state["conformation_ir"] = (
+        step_state["preproc_state_ir"], step_state["batch_ir"] = (
             model_ir.preprocessing(
                 model_ir.preproc_state,
-                update_conformation_ir(conformation, system),
+                update_batch_ir(batch, dynamics_state),
             )
         )
 
-    system, _ = update_observables(system, conformation)
+    dynamics_state, out = update_observables(dynamics_state, batch)
+    # The restart recomputes forces and virial on a freshly built neighbor
+    # list, whose pair order changes their last bits. Continue from the saved
+    # values so that a restarted run reproduces the uninterrupted one, unless
+    # they differ by more than round-off (e.g. the model or a bias changed).
+    for key in ("forces", "pressure_tensor"):
+        if key in restart_data and key in dynamics_state:
+            saved = np.asarray(restart_data[key])
+            current = np.asarray(dynamics_state[key])
+            scale = float(np.max(np.abs(current))) if current.size else 0.0
+            if saved.shape == current.shape and np.allclose(saved, current, rtol=1e-4, atol=1e-4 * scale):
+                dynamics_state[key] = jnp.asarray(saved, dtype=dynamics_state[key].dtype)
+    if "pressure_tensor" in dynamics_state:
+        dynamics_state["pressure"] = jnp.trace(dynamics_state["pressure_tensor"]) * (1.0 / 3.0)
 
-    return step, update_conformation, system_data, dyn_state, conformation, system
+    if input_keys_to_keep is not None:
+        for key in input_keys_to_keep:
+            batch[key] = out[key]
+            
+
+    return step, update_batch, simulation_setup, step_state, batch, dynamics_state

@@ -16,6 +16,7 @@ Active Learning tutorial in this [Colab notebook](https://colab.research.google.
     - [From PyPI](#from-pypi)
     - [Latest version from Github repo](#latest-version-from-github-repo)
     - [Optional dependencies](#optional-dependencies)
+- [Selecting a device](#selecting-a-device)
 - [Examples](#examples)
 - [Citation](#citation)
 - [License](#license)
@@ -69,6 +70,10 @@ for step in range(10):
 
 
 ## Installation
+
+Use Python 3.12 or newer. The dependency minimums are declared in
+`pyproject.toml`; install into a fresh virtual environment when upgrading.
+
 ### From PyPI
 ```bash
 # CPU version
@@ -76,6 +81,12 @@ pip install fennol
 
 # GPU version
 pip install "fennol[cuda]"
+
+# Training (includes PyTorch dataloaders)
+pip install "fennol[train]"
+
+# Training with optional MLflow tracking
+pip install "fennol[train,mlflow]"
 ```
 
 ### Latest version from Github repo
@@ -101,18 +112,44 @@ cd FeNNol
 pip install .
 ```
 
+For a development checkout, `uv sync` installs the training extra and test
+dependencies by default. Use `uv sync --no-group training` to omit PyTorch.
+
 ### Optional dependencies
 - Some modules require e3nn-jax (https://github.com/e3nn/e3nn-jax) which can be installed with:
 ```bash
 pip install --upgrade e3nn-jax
 ```
-- The provided training script requires pytorch (at least the cpu version) for dataloaders:
+- The training extra installs PyTorch. To choose its CPU-only build explicitly:
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 - For the Deep-HP interface, cffi and pycuda are required:
 ```bash
 pip install cffi pycuda
+```
+
+## Selecting a device
+FeNNol runs on the CPU unless a device is selected. `fennol_md`, `fennol_analyze` and `fennol_train` take the device from, by decreasing priority:
+1. the `--device` argument (`fennol_md` and `fennol_analyze`),
+2. the `FENNOL_DEVICE` environment variable,
+3. the `device` keyword of the input or configuration file,
+4. `cpu` by default.
+
+```bash
+fennol_md input.fnl --device cuda:1
+FENNOL_DEVICE=gpu fennol_md input.fnl
+```
+
+The accepted values are `cpu`, `gpu` or `cuda` (the first visible GPU) and `gpu:N` or `cuda:N`. `N` counts among the GPUs exposed by `CUDA_VISIBLE_DEVICES`: on a cluster, `cuda:0` is the first GPU that the scheduler allocated to the job. FeNNol only opens the selected GPU, on which JAX preallocates 75% of the memory by default; see the [JAX documentation](https://docs.jax.dev/en/latest/gpu_memory_allocation.html) to change this.
+
+When FeNNol is used as a library, for example through the ASE calculator, JAX opens every visible GPU by default. To select a single device, call `configure_device` before any JAX computation, including loading a model:
+```python
+from fennol import configure_device
+from fennol.ase import FENNIXCalculator
+
+configure_device("cuda:0")
+calc = FENNIXCalculator("model.fnx")
 ```
 
 ## Examples

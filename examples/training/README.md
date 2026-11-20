@@ -30,7 +30,7 @@ fennol_train ani.yaml
 ```
 Training on GPU should only take a few minutes. Training on CPU should take about 15min for the ANI model. At the end of training, mean absolute errors on both energy and forces should be below the kcal/mol.
 
-Results will be saved in a directory named `run_dir_aspirin_ani2x` (the `output_directory` key in the input file).
+Results will be saved in a directory named `run_dir_aspirin_ani` (the `output_directory` key in the input file).
 This directory should contain the following files:
 - `train.log` contains the training log (a copy of the standard output from the command).
 - `config.yaml` is a copy the input file.

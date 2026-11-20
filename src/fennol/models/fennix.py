@@ -181,9 +181,9 @@ class FENNIX:
         self, energy_terms: Union[Sequence[str], None], jit: bool = True
     ) -> None:
         """Set the energy terms to be computed by the model and prepare the energy and force functions."""
-        object.__setattr__(self, "energy_terms", energy_terms)
         if isinstance(energy_terms, str):
             energy_terms = [energy_terms]
+        object.__setattr__(self, "energy_terms", energy_terms)
         
         if energy_terms is None or len(energy_terms) == 0:
 
@@ -372,6 +372,7 @@ class FENNIX:
 
         def _energy_gradient(variables, data):
             def _etot(variables, inputs):
+                use_pbc = "cells" in inputs or "cells" in data
                 if "strain" in inputs:
                     scaling = inputs["strain"]
                     batch_index = data["batch_index"]
@@ -380,12 +381,13 @@ class FENNIX:
                         coordinates, scaling[batch_index]
                     )
                     inputs = {**inputs, "coordinates": coordinates}
-                    if "cells" in inputs or "cells" in data:
+                    if use_pbc:
                         cells = inputs["cells"] if "cells" in inputs else data["cells"]
                         cells = jax.vmap(jnp.matmul)(cells, scaling)
                         inputs["cells"] = cells
-                if "cells" in inputs:
-                    reciprocal_cells = jnp.linalg.inv(inputs["cells"])
+                if use_pbc:
+                    cells = inputs["cells"] if "cells" in inputs else data["cells"]
+                    reciprocal_cells = jnp.linalg.inv(cells)
                     inputs = {**inputs, "reciprocal_cells": reciprocal_cells}
                 energy, out = self._total_energy_raw(variables, {**data, **inputs})
                 return energy.sum(), out
@@ -452,7 +454,7 @@ class FENNIX:
 
         if example_data is None:
             rng_key_sys, rng_key_pre = jax.random.split(rng_key_pre)
-            example_data = self.generate_dummy_system(rng_key_sys, n_atoms=10)
+            example_data = self.generate_dummy_system(rng_key_sys, n_atoms=2)
 
         preproc_state, inputs = self.preprocessing.init_with_output(example_data)
         object.__setattr__(self, "preproc_state", preproc_state)

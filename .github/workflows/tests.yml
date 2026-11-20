@@ -1,0 +1,84 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAX_PLATFORMS: cpu
+
+jobs:
+  test:
+    name: Test suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    # The lockfile pins CPU-only torch for the training extra.
+    - name: Install project from the lockfile
+      run: uv sync --locked --extra train --group dev
+    - name: Run test suite
+      run: uv run --no-sync python -m pytest -q -rs
+
+  test-without-training:
+    name: Test suite without PyTorch
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: "3.12"
+    - name: Install project without the training extra
+      run: uv sync --locked --no-group training --group dev
+    - name: Verify PyTorch is absent
+      run: uv run --no-sync python -c "import importlib.util; assert importlib.util.find_spec('torch') is None"
+    - name: Run test suite
+      run: uv run --no-sync python -m pytest -q -rs
+
+  package:
+    name: Build and install distributions
+    runs-on: ubuntu-latest
+    steps:
+    # The version comes from git tags (setuptools-scm).
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: "3.12"
+    - name: Build wheel and source distribution
+      run: uv build
+    # Each distribution goes into a fresh environment with dependencies
+    # resolved from its own metadata, not from the lockfile.
+    - name: Install and run entry points
+      run: |
+        for dist in dist/*.whl dist/*.tar.gz; do
+          echo "::group::$dist"
+          env_dir="${RUNNER_TEMP}/env-$(basename "$dist")"
+          uv venv "$env_dir"
+          uv pip install --python "$env_dir" torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python "$env_dir" "FeNNol[train] @ file://${PWD}/${dist}"
+          (cd "${RUNNER_TEMP}" && for cli in fennol_md fennol_train fennol_analyze fennol_inspect; do
+            "$env_dir/bin/$cli" --help > /dev/null
+          done)
+          echo "::endgroup::"
+        done

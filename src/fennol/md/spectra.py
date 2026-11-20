@@ -17,7 +17,7 @@ from ..utils.deconvolution import (
     kernel_lorentz,
 )
 
-def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo_fact=False):
+def initialize_ir_spectrum(simulation_parameters,simulation_setup,fprec,dt,apply_kubo_fact=False):
     state = {}
 
     parameters = simulation_parameters.get("ir_parameters", {})
@@ -26,7 +26,7 @@ def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo
     Required for ir_spectrum=True
     """
     dipole_model = parameters["dipole_model"]
-    dipole_model = Path(str(dipole_model).strip())
+    dipole_model = Path(str(dipole_model).strip()).expanduser().resolve()
     if not dipole_model.exists():
         raise FileNotFoundError(f"Dipole model file {dipole_model} not found")
     else:
@@ -38,7 +38,7 @@ def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo
         Neighbor list skin distance for dipole model preprocessing (in Angstroms).
         Default: -1.0
         """
-        pbc_data = system_data.get("pbc", None)
+        pbc_data = simulation_setup.get("pbc", None)
 
         ### CONFIGURE PREPROCESSING
         preproc_state = unfreeze(dipole_model.preproc_state)
@@ -94,7 +94,7 @@ def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo
     if use_qvel:
         state["qvel"] = jnp.zeros((3,), dtype=fprec)
     else:
-        nat = system_data["nat"]
+        nat = simulation_setup["nat"]
         state["musave-2"] = jnp.zeros((3,), dtype=fprec)
         state["musave-1"] = jnp.zeros((3,), dtype=fprec)
         state["qsave-2"] = jnp.zeros((nat,1), dtype=fprec)
@@ -105,7 +105,7 @@ def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo
     state["Cmumu"] = jnp.zeros((nom,), dtype=fprec)
     state["first"] = True
 
-    kT = system_data["kT"]
+    kT = simulation_setup["kT"]
     kubo_fact = np.ones_like(omega)
     if apply_kubo_fact:
         uu = 0.5*us.HBAR*omega[1:]/kT
@@ -130,10 +130,10 @@ def initialize_ir_spectrum(simulation_parameters,system_data,fprec,dt,apply_kubo
         print("# Deconvolution of IR spectra with gamma=", gamma*(1./us.PS),"ps^-1 and niter=",niter_deconv)
     
 
-    temp_K = system_data["temperature"]
+    temp_K = simulation_setup["temperature"]
     c=2.99792458e-2 # speed of light in cm/ps
     mufact = 1000*418.40*332.063714*2*np.pi**2/(0.831446215*temp_K*3.*c)
-    pbc_data = system_data.get("pbc", None)
+    pbc_data = simulation_setup.get("pbc", None)
     if pbc_data is not None:
         cell = pbc_data["cell"]
         volume = np.abs(np.linalg.det(cell))

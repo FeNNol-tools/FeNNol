@@ -1,0 +1,144 @@
+# Quick scientific checks for the enhanced-sampling and lambda-dynamics methods.
+# Each case is one short run with loose tolerances: the goal is to catch real
+# defects (wrong estimator, missing bias, broken restart), not to certify tight
+# convergence. Energies are in kcal/mol, lengths in Angstrom.
+temperature_kelvin: 300.0
+kbt_kcal_per_mol: 0.5961612776
+species: Ar
+dt_fs: 5.0
+langevin_friction_thz: 5.0
+output_interval_steps: 10
+
+# Polynomial coefficients per axis, ascending powers starting at q**1, in
+# kBT/Angstrom**n. Every potential is separable and confining on all axes.
+potentials:
+  # Tilted single well x**4 + x**2 + 1.5 x: asymmetric so that sign, offset
+  # or Gaussian-shape errors in the reconstruction cannot cancel.
+  single_well_1d:
+    x: [1.5, 1.0, 0.0, 1.0]
+    y: [0.0, 0.5]
+    z: [0.0, 0.5]
+  # Adds a second, differently tilted quartic well along y.
+  single_well_2d:
+    x: [1.5, 1.0, 0.0, 1.0]
+    y: [-1.0, 0.5, 0.0, 0.5]
+    z: [0.0, 0.5]
+  # 8 (x**2 - 1)**2 + 0.5 x: 8 kBT barrier, left well favoured by about 1 kBT.
+  double_well:
+    x: [0.5, -16.0, 0.0, 8.0]
+    y: [0.0, 0.5]
+    z: [0.0, 0.5]
+
+# Free-energy profiles are scored where the reference lies within this window
+# above its minimum; the rest of the domain is rarely visited by design.
+score_window_kbt: 4.0
+minimum_coverage_fraction: 0.9
+pmf_rmse_tolerance_kbt: 0.3
+population_tolerance: 0.1
+
+methods:
+  opes:
+    opes: {barrier_kbt: 6.0, pace: 20, sigma: 0.2, tseg_ps: 0.5}
+  explore:
+    opes: {barrier_kbt: 6.0, pace: 20, sigma: adaptive, explore: true, tseg_ps: 0.5}
+  metad:
+    opes: {barrier_kbt: 6.0, pace: 20, sigma: 0.2, metadyn: true, hill_height_kbt: 0.5, tseg_ps: 0.5}
+  eabf:
+    abf: {sigma: 0.12, fullsamples: 20, tau_fs: 100.0, gamma_thz: 1000.0, tseg_ps: 0.05}
+  eabf_metad:
+    abf: {sigma: 0.12, fullsamples: 20, tau_fs: 100.0, gamma_thz: 1000.0, tseg_ps: 0.05,
+          metad_height_kbt: 0.5, metad_pace: 20, metad_sigma: 0.12, metad_bias_factor: 4.0}
+
+pmf_1d:
+  potential: single_well_1d
+  methods: [opes, explore, metad, eabf, eabf_metad]
+  start: [-0.5, 0.0, 0.0]
+  burn_in_steps: 4000
+  production_steps: 200000
+  grid: [-2.0, 2.0, 0.05]
+
+pmf_2d:
+  potential: single_well_2d
+  methods: [opes, explore, metad]
+  start: [-0.5, 0.6, 0.0]
+  burn_in_steps: 4000
+  production_steps: 300000
+  grid: [-2.0, 2.0, 0.1]
+  # The joint surface includes sparsely visited corners; marginals keep the
+  # common 0.3 kBT tolerance.
+  joint_rmse_tolerance_kbt: 0.6
+
+# Paired barrier-crossing screen: plain MD should almost never cross, the
+# biased runs must cross often. Passages count only between commitment
+# regions, after burn-in.
+barrier:
+  potential: double_well
+  methods: [plain, opes, explore, metad, eabf, eabf_metad]
+  barrier_kbt: 10.0
+  start: [-1.0, 0.0, 0.0]
+  burn_in_steps: 4000
+  production_steps: 200000
+  commit: [-0.6, 0.6]
+  grid: [-1.6, 1.6, 0.05]
+  minimum_biased_passages: 10
+  maximum_plain_passages: 3
+
+# Split versus uninterrupted runs must leave identical dynamics and bias state.
+restart:
+  potential: single_well_1d
+  methods: [opes, explore, metad, eabf, eabf_metad]
+  start: [-0.5, 0.0, 0.0]
+  steps: 800
+  grid: [-2.0, 2.0, 0.05]
+
+lambda:
+  dt_fs: 5.0
+  # Lambda mass in kcal/mol ps**2 and friction in ps**-1, chosen so that
+  # lambda diffuses across [0, 1] within a fraction of a picosecond.
+  mass_lambda: 0.05
+  gamma_lambda_thz: 10.0
+  bin_width: 0.02
+  tseg_ps: 0.05
+  fullsamples: 50
+  environment_k: 1.0
+  opes: {barrier_kbt: 4.0, pace: 20, sigma: 0.05}
+  # Stiffness k(lambda) = k0 + ke*elambda + kv*vlambda in kcal/mol/A**2 acting
+  # on n_ligand atoms; exact F(lambda) = 1.5 n_ligand kBT log k(lambda).
+  models:
+    electrostatic: {k0: 1.0, ke: 3.0, kv: 0.0, n_ligand: 1}
+    vdw: {k0: 1.0, ke: 0.0, kv: 3.0, n_ligand: 1}
+    combined: {k0: 1.0, ke: 1.5, kv: 1.5, n_ligand: 1}
+    # Rises to k=10 at lambda=0.5 and returns to k=1: a 13.8 kBT barrier. The
+    # end-state basins are narrow in lambda, so a lower barrier is crossed
+    # often even without bias (transition-state rate ~0.05/ps at 6.9 kBT).
+    barrier: {k0: 1.0, ke: -9.0, kv: 9.0, n_ligand: 4}
+  ti:
+    # lambda-ABF (default), with OPES on top, and plain lambda dynamics.
+    cases:
+      electrostatic: {model: electrostatic}
+      vdw: {model: vdw}
+      combined: {model: combined}
+      combined_opes: {model: combined, opes: true}
+      combined_plain: {model: combined, abf: false}
+    start_lambda: 0.3
+    burn_in_steps: 2000
+    production_steps: 60000
+    gradient_rmse_tolerance_kbt: 0.5
+    delta_f_tolerance_kbt: 0.2
+  barrier:
+    model: barrier
+    cases:
+      plain: {abf: false}
+      abf: {}
+      abf_opes: {opes: true}
+    opes: {barrier_kbt: 15.0, pace: 20, sigma: 0.05}
+    start_lambda: 0.05
+    burn_in_steps: 2000
+    production_steps: 60000
+    commit: [0.15, 0.85]
+    minimum_biased_passages: 10
+    maximum_plain_passages: 3
+  restart:
+    model: combined
+    opes: true
+    steps: 400

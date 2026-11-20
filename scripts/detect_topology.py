@@ -35,7 +35,7 @@ def main():
     args = parser.parse_args()
 
     # check the input file
-    input_file = args.xyz_file.resolve()
+    input_file = args.xyz_file.expanduser().resolve()
     assert input_file.exists(), f"Input file {input_file} does not exist"
     system_name = input_file.stem
     has_comment_line = not args.nocomment

@@ -8,6 +8,7 @@ import jax
 import dataclasses
 
 from .fennix import FENNIX
+from ..utils.device import configure_device
 
 
 class IndentDumper(yaml.Dumper):
@@ -16,9 +17,7 @@ class IndentDumper(yaml.Dumper):
 
 
 def main():
-    # os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    _device = jax.devices("cpu")[0]
-    jax.config.update("jax_default_device", _device)
+    configure_device("cpu")
     ### Read the parameter file
     parser = argparse.ArgumentParser(prog="fennol_inspect")
     parser.add_argument("model_file", type=Path, help="Model file")
@@ -38,7 +37,7 @@ def main():
         "-p","--prm", action="store_true", help="Print parameter shapes"
     )
     args = parser.parse_args()
-    model_file = args.model_file
+    model_file = args.model_file.expanduser().resolve()
     # param_shapes = args.param_shapes
     # short = args.short
     # all = args.all

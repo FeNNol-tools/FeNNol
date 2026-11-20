@@ -17,7 +17,11 @@ from ..utils.deconvolution import (
 from ..utils.periodic_table import PERIODIC_TABLE
 
 
-def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, restart_data={}):
+# Thermostats that do not exchange momentum with a bath.
+MOMENTUM_CONSERVING_THERMOSTATS = ("NVE", "NONE", "BUSSI", "NOSE", "NOSEHOOVER", "NOSE_HOOVER")
+
+
+def get_thermostat(simulation_parameters, dt, simulation_setup, fprec, rng_key=None, restart_data={}):
     state = {}
     postprocess = None
     
@@ -36,9 +40,9 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
     Default: False
     """
 
-    kT = system_data.get("kT", None)
-    nbeads = system_data.get("nbeads", None)
-    mass = system_data["mass"]
+    kT = simulation_setup.get("kT", None)
+    nbeads = simulation_setup.get("nbeads", None)
+    mass = simulation_setup["mass"]
     gamma0 = simulation_parameters.get("gamma", 1.0 / us.THZ)
     """@keyword[fennol_md] gamma
     Friction coefficient for Langevin thermostat.
@@ -47,7 +51,18 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
     gamma = gamma0
     if gamma <= 0.0:
         gamma = 0.0
-    species = system_data["species"]
+    species = simulation_setup["species"]
+    massprop = simulation_setup["mass_Da"]/simulation_setup["totmass_Da"]
+    remove_com = simulation_setup.get("remove_com_velocity", False)
+    ndof = simulation_setup.get("ndof", 3 * simulation_setup.get("nfree", len(species)))
+
+    def without_com(vel):
+        """Remove the centre-of-mass velocity of each replica."""
+        if not remove_com:
+            return vel
+        v = vel.reshape(-1, massprop.shape[0], 3)
+        vcom = jnp.sum(v * massprop[None, :, None], axis=1, keepdims=True)
+        return (v - vcom).reshape(vel.shape)
 
     if nbeads is not None:
         trpmd_lambda = simulation_parameters.get("trpmd_lambda", 1.0)
@@ -55,7 +70,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
         Lambda parameter for TRPMD (Thermostatted Ring Polymer MD).
         Default: 1.0
         """
-        gamma = np.maximum(trpmd_lambda * system_data["omk"], gamma)
+        gamma = np.maximum(trpmd_lambda * simulation_setup["omk"], gamma)
 
     if thermostat_name in ["LGV", "LANGEVIN", "FFLGV"]:
         default_ekin_instant = "O"
@@ -131,6 +146,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
         assert kT is not None, "kT must be specified for QTB thermostat"
         assert gamma is not None, "gamma must be specified for QTB thermostat"
         assert nbeads is None, "Bussi thermostat is not compatible with PIMD"
+        assert simulation_setup["nreplicas"] == 1, "Bussi thermostat is not compatible with replicas"
         rng_key, v_key = jax.random.split(rng_key)
 
         a1 = math.exp(-gamma * dt)
@@ -147,9 +163,10 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
         def thermostat(vel, state):
             rng_key, noise_key = jax.random.split(state["rng_key"])
             new_state = {**state, "rng_key": rng_key}
-            noise = jax.random.normal(noise_key, vel.shape, dtype=vel.dtype)
+            vel = without_com(vel)
+            noise = jax.random.normal(noise_key, ndof, dtype=vel.dtype)
             R2 = jnp.sum(noise**2)
-            R1 = noise[0, 0]
+            R1 = noise[0]
             c = a2 / (mass[:, None] * vel**2).sum()
             d = (a1 * c) ** 0.5
             scale = (a1 + c * R2 + 2 * d * R1) ** 0.5
@@ -196,11 +213,11 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
                 mass.shape[0] * 3
             )
             vel = vel * (kT / kTsys[:, None, None]) ** 0.5
-        thermostat = lambda x, s: (x, s)
+        thermostat = lambda x, s: (without_com(x), s)
 
     elif thermostat_name in ["NOSE", "NOSEHOOVER", "NOSE_HOOVER"]:
         assert gamma is not None, "gamma must be specified for QTB thermostat"
-        ndof = mass.shape[0] * 3
+        assert simulation_setup["nreplicas"] == 1, "Nose-Hoover thermostat is not compatible with replicas"
         nkT = ndof * kT
         nose_mass = nkT / gamma**2
         assert nbeads is None, "Nose-Hoover is not compatible with PIMD"
@@ -219,6 +236,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
         def thermostat(vel, state):
             nose_s = state["nose_s"]
             nose_v = state["nose_v"]
+            vel = without_com(vel)
             kTsys = jnp.sum(mass[:, None] * vel**2)
             nose_v = nose_v + (0.5 * dt / nose_mass) * (kTsys - nkT)
             nose_s = nose_s + dt * nose_v
@@ -248,7 +266,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
 
         thermostat, postprocess, qtb_state = initialize_qtb(
             simulation_parameters,
-            system_data,
+            simulation_setup,
             fprec=fprec,
             dt=dt,
             mass=mass,
@@ -297,7 +315,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
         Default: 1.0
         """
         assert (
-            anneal_steps < 1.0 and anneal_steps > 0.0
+            anneal_steps <= 1.0 and anneal_steps > 0.0
         ), "warmup_steps must be between 0 and nsteps"
         pct_start = anneal_parameters.get("warmup_steps", 0.3)
         """@keyword[fennol_md] annealing/warmup_steps
@@ -308,7 +326,7 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
             pct_start < 1.0 and pct_start > 0.0
         ), "warmup_steps must be between 0 and nsteps"
 
-        anneal_type = anneal_parameters.get("type", "cosine").lower()
+        anneal_type = anneal_parameters.get("type", "cosine_onecycle").lower()
         """@keyword[fennol_md] annealing/type
         Type of annealing schedule (linear, cosine_onecycle).
         Default: cosine
@@ -359,15 +377,15 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
     else:
         raise ValueError(f"Unknown thermostat {thermostat_name}")
     
-    # remove center of mass velocity
-    massprop = system_data["mass_Da"]/system_data["totmass_Da"]
-    if nbeads is None:
-        vel = vel.reshape(-1,system_data["nat"], 3)
-        vcom = jnp.sum(vel * massprop[None,:, None], axis=1, keepdims=True)
-        vel = (vel - vcom).reshape(-1,3)
-    else:
-        vcom = jnp.sum(vel[0]*massprop[:,None], axis=0, keepdims=True)
-        vel = vel.at[0].set(vel[0] - vcom)
+    # remove center of mass velocity, unless it is a thermal degree of freedom (remove_com: false)
+    if not simulation_setup.get("thermal_com", False):
+        if nbeads is None:
+            vel = vel.reshape(-1,simulation_setup["nat"], 3)
+            vcom = jnp.sum(vel * massprop[None,:, None], axis=1, keepdims=True)
+            vel = (vel - vcom).reshape(-1,3)
+        else:
+            vcom = jnp.sum(vel[0]*massprop[:,None], axis=0, keepdims=True)
+            vel = vel.at[0].set(vel[0] - vcom)
 
     ekin_instant = str(simulation_parameters.get("ekin_instant", default_ekin_instant)).upper()
     """@keyword[fennol_md] ekin_instant
@@ -377,12 +395,27 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None, 
     """
     assert ekin_instant in ["B", "O"], "ekin_instant must be 'B' or 'O'"
 
+    # Runtime thermostat state (and the separate QTB postprocessing state)
+    # belongs to the thermostat initializer, alongside its state schema.
+    # QTB/adQTB maintain their own restart data. Restoring their generic step
+    # state would desynchronize `istep` from initialize_qtb's closure-local
+    # segment counter, which is not part of the generic checkpoint.
+    uses_qtb_restart = thermostat_name in ["QTB", "ADQTB"]
+    if not uses_qtb_restart and "thermostat" in restart_data:
+        state = {**state, **restart_data["thermostat"]}
+    if (
+        not uses_qtb_restart
+        and postprocess is not None
+        and "thermostat_post_state" in restart_data
+    ):
+        postprocess = (postprocess[0], restart_data["thermostat_post_state"])
+
     return thermostat, postprocess, state, vel,thermostat_name, ekin_instant
 
 
 def initialize_qtb(
     simulation_parameters,
-    system_data,
+    simulation_setup,
     fprec,
     dt,
     mass,
@@ -407,6 +440,9 @@ def initialize_qtb(
     mass = jnp.asarray(mass, dtype=fprec)
 
     nat = species.shape[0]
+    nfree = simulation_setup["nfree"]*simulation_setup["nreplicas"]
+    if nfree != nat:
+        raise NotImplementedError("QTB is not compatible with constrained systems yet.")
     # define type indices
     species_set = set(species)
     nspecies = len(species_set)
@@ -454,6 +490,7 @@ def initialize_qtb(
     Kinetic energy correction factor for QTB (-1 for automatic).
     Default: -1
     """
+    n_same_kin = qtb_parameters.get("n_same_kin", 10)
     do_corr_kin = corr_kin <= 0
     if do_corr_kin:
         corr_kin = 1.0
@@ -585,20 +622,31 @@ def initialize_qtb(
         Default: SIMPLE
         """
         if adaptation_method == "SIMPLE":
-            agamma = qtb_parameters.get("agamma", 0.1)
+            agamma = qtb_parameters.get("agamma", 1.e-2)
             """@keyword[fennol_md] qtb/agamma
             Learning rate for adaptive QTB gamma update.
             Default: 0.1
             """
             assert agamma > 0, "agamma must be positive"
-            a1_ad = agamma * Tseg  #  * gamma
             print(f"# ADQTB SIMPLE: agamma = {agamma:.3f}")
+            tau_s = qtb_parameters.get("tau_s", 50. * Tseg)
+            b2 = np.exp(-Tseg / tau_s)
+            post_state["dFDT_s"] = jnp.zeros((ntypes,1), dtype=fprec)
+            post_state["nada"] = 0
 
             def update_gammar(post_state):
-                g = post_state["dFDT"]
-                gammar = post_state["gammar"] - a1_ad * g
+                dFDT = post_state["dFDT"]
+                dFDT_s = (
+                    post_state["dFDT_s"] * b2
+                    + (dFDT ** 2).mean(axis=-1,keepdims=True) * (1.0 - b2)
+                )
+                nada = post_state["nada"] + 1
+                gnorm = (dFDT_s / (1.0 - b2**nada) + 1.0e-8)**0.5
+                g = dFDT / gnorm
+                gammar = post_state["gammar"] - agamma * g
                 gammar = jnp.maximum(gammar_min, gammar)
-                return {**post_state, "gammar": gammar}
+                return {**post_state, "gammar": gammar, 
+                        "dFDT_s": dFDT_s, "nada": nada}
 
         elif adaptation_method == "RATIO":
             tau_ad = qtb_parameters.get("tau_ad", 5.0 / us.PS) 
@@ -649,7 +697,6 @@ def initialize_qtb(
                 f"# ADQTB ADABELIEF: agamma = {agamma:.3f}, tau_ad = {tau_ad*us.PS:.2f} ps, tau_s = {tau_s*us.PS:.2f} ps"
             )
 
-            a1_ad = agamma * gamma  # * Tseg #* gamma
             b1 = np.exp(-Tseg / tau_ad)
             b2 = np.exp(-Tseg / tau_s)
             post_state["dFDT_m"] = jnp.zeros((ntypes, nom), dtype=fprec)
@@ -663,12 +710,11 @@ def initialize_qtb(
                 dFDT_s = (
                     post_state["dFDT_s"] * b2
                     + (dFDT - dFDT_m) ** 2 * (1.0 - b2)
-                    + 1.0e-8
                 )
                 # bias correction
                 mt = dFDT_m / (1.0 - b1**n_adabelief)
                 st = dFDT_s / (1.0 - b2**n_adabelief)
-                gammar = post_state["gammar"] - a1_ad * mt / (st**0.5 + 1.0e-8)
+                gammar = post_state["gammar"] - agamma * mt / (st+1.e-8)**0.5
                 gammar = jnp.maximum(gammar_min, gammar)
                 return {
                     **post_state,
@@ -684,7 +730,7 @@ def initialize_qtb(
     
     #####################
     # RESTART
-    restart_file = system_data["name"]+".qtb.restart"
+    restart_file = simulation_setup["name"]+".qtb.restart"
     if os.path.exists(restart_file):
         with open(restart_file, "rb") as f:
             data = pickle.load(f)
@@ -769,9 +815,9 @@ def initialize_qtb(
 
         # print("# corr_kin: ", corr_kin)
         do_corr_kin = post_state["do_corr_kin"]
-        if isame_kin > 10:
+        if isame_kin > n_same_kin:
             print(
-                "# INFO: corr_kin is converged (it did not change for 10 consecutive segments)"
+                f"# INFO: corr_kin is converged (it did not change for {n_same_kin} consecutive segments)"
             )
             do_corr_kin = False
 

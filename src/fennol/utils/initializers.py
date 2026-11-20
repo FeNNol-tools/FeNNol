@@ -1,7 +1,8 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from typing import Callable,Union
+from typing import Callable, Union
+
 
 def scaled_orthogonal(
     scale=1.0, mode="fan_avg", in_axis=-2, out_axis=-1, dtype=jnp.float_
@@ -30,7 +31,7 @@ def scaled_orthogonal(
     return init
 
 
-def initializer_from_str(name: Union[str,Callable,None])->Callable:
+def initializer_from_str(name: Union[str, Callable, None]) -> Callable:
     if name is None:
         return nn.initializers.lecun_normal()
     if callable(name):
@@ -39,8 +40,8 @@ def initializer_from_str(name: Union[str,Callable,None])->Callable:
         raise ValueError(f"Invalid initializer {name}")
     return eval(
         name,
-        {"__builtins__": None},
         {
+            "__builtins__": None,
             **nn.initializers.__dict__,
             "scaled_orthogonal": scaled_orthogonal,
         },
